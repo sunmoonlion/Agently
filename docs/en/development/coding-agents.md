@@ -36,9 +36,9 @@ The companion repo does not become a runtime dependency of your Agently app. It 
 
 | Skill | Use when the user is |
 |---|---|
-| `agently-playbook` | starting fresh — picking the right structure for a new Agently project |
+| `agently` | starting fresh — picking the right structure for a new Agently project |
 | `agently-request` | model setup, prompt management, structured output, response reuse, session memory, embeddings, retrieval |
-| `agently-runtime` | Action Runtime, built-in actions, MCP, Execution Environment, FastAPI exposure, DevTools wiring |
+| `agently-runtime` | Action Runtime, built-in actions, MCP, ExecutionResource, FastAPI exposure, DevTools wiring |
 | `agently-dynamic-task` | model-generated or app-submitted DAG planning, validation, and execution |
 | `agently-triggerflow` | needing branching, concurrency, pause/resume, save/load |
 | `agently-migration` | migrating from LangChain, LangGraph, LlamaIndex, CrewAI, or similar systems |
@@ -63,7 +63,7 @@ For CLI-based installs, the default `app` bundle is:
 
 ```bash
 for skill in \
-  agently-playbook \
+  agently \
   agently-request \
   agently-runtime \
   agently-dynamic-task \
@@ -73,7 +73,7 @@ do
 done
 ```
 
-Add `agently-migration` only for migration projects. The frozen V1 12-skill catalog lives under `Agently-Skills/legacy/v1/` and last supports Agently `4.1.1`; do not use it as the recommended path for new projects.
+Add `agently-migration` only for migration projects. Historical catalogs are kept on frozen archive branches instead of the default branch; the V1 12-skill catalog is archived on `update/archive-legacy-v1-catalog` and last supports Agently `4.1.1`. Do not add archived catalogs to a coding agent's normal search path for new projects.
 
 ## Why skills, not just docs
 
@@ -110,13 +110,14 @@ When adding a framework deprecation, route the warning through `agently.utils.De
 When you audit or author guidance for Agently `4.1+`, these are the defaults coding agents should prefer:
 
 - API shape: apply Occam's razor. Do not add a new entity, method, facade, or compatibility patch when an existing surface already expresses the concept. If a name is unclear, prefer a narrow alias or documentation clarification over another overlapping method.
-- Structured output: for fixed required leaves, mark `(TypeExpr, "description", True)` directly in `.output(...)`. Use manual `ensure_keys=` only for conditional or runtime-dependent paths.
+- Structured output: for fixed required leaves, mark `(TypeExpr, "description", True)` directly in `.output(...)`. Use `(TypeExpr, "description", "not_null")` only when empty values must retry. Use manual `ensure_keys=` only for conditional or runtime-dependent paths.
 - Actions: new code should start from `@agent.action_func` and `agent.use_actions(...)`. `tool_func`, `use_tool`, and `use_tools` are compatibility aliases, not the primary recommendation.
 - TriggerFlow lifecycle: treat `close()` / `async_close()` and the close snapshot as the canonical completion path. Do not recommend `.end()`, `set_result()`, `get_result()`, or `wait_for_result=` as the normal starting point.
 - TriggerFlow state: use `get_state(...)` / `set_state(...)` for per-execution data. Treat `flow_data` as an intentionally risky shared scope, not a normal state store.
 - Settings loading: when provider settings live in files, prefer `Agently.load_settings("yaml_file", path, auto_load_env=True)`. Keep `Agently.set_settings(...)` for inline overrides.
 - Execution style: prefer async-first for services, streaming, and workflows. Treat sync APIs as wrappers for scripts, REPL use, or compatibility bridges.
-- Response reuse: when one model call must be consumed as text, parsed data, metadata, or structured stream updates, prefer `get_response()` and reuse the same response object rather than re-requesting.
+- Result reuse: when one model call must be consumed as text, parsed data, metadata, or structured stream updates, prefer `get_result()` and reuse the same result object rather than re-requesting.
+- Task execution quality: when a goal-pursuit task must use a particular capability (an Action, Skill, or Skill pack), do not lean on a strong instruction in the prompt or a business-specific special case to force or check it. Express the requirement as framework contract: make capabilities visible to the planner (`planner_capabilities`), bound action steps with structured `step_scope` that reaches the ActionRuntime boundary, and require completion evidence with a structured `capability_evidence_requirements` entry. For Skills steps that may produce long artifact text, configure the Skills route output format instead of forcing large raw content through JSON streaming. If a Skills step needs file writes, reads, shell calls, HTTP calls, or other side effects, explicitly grant the action/tool scope through route/effort configuration, declare required side-effect actions when the React strategy should stop after they succeed, and require `action_succeeded` evidence for the host actions; Skills provide guidance, while ActionRuntime owns callable execution and evidence. Prior-step Workspace context must preserve action evidence before bulky execution metadata. TaskDAG / DynamicTask is not an AgentTask bounded-step strategy; use TaskDAG / DynamicTask separately when the application or visual automation surface owns the submitted graph. The AgentTask host guard checks requirements deterministically against execution evidence; the prompt is explanatory, not the guarantee. Keep scenario-specific checks (visual fingerprints, domain names, source choices) in examples and tests, never in framework paths.
 
 ## When to write your own skill
 
@@ -130,7 +131,7 @@ Feature acceptance also requires spec reconciliation: update the relevant spec t
 
 User-visible feature work must add or update examples for the scenario the feature enables. Keep the example runnable in its declared environment, aligned with the current recommended API, and explicit about the important runtime behavior. Its `Expected key output` comment should preserve stable key values from one real run, not a generic "shows X" description. When the behavior is not obvious from output alone, add concise working-principle notes or an ASCII flow diagram in the example comment.
 
-For Agently `4.1.3` development work, include `examples/agent_auto_orchestration/` when the task touches default `agent.start()` routing, `agent.create_execution()`, or Agent process streaming. Treat local smoke scripts in that directory as infrastructure checks only; model-app or acceptance claims still require real DeepSeek or local Ollama examples. For the 4.1.2.5 foundation line, treat `examples/cookbook/`, `examples/action_runtime/`, `examples/execution_environment/`, `examples/builtin_actions/`, `examples/trigger_flow/`, `examples/dynamic_task/`, and `examples/fastapi/` as the recommended starting surfaces. Treat `examples/archived/` as compatibility reference only.
+For Agently `4.1.3` development work, include `examples/agent_auto_orchestration/` when the task touches default `agent.start()` routing, `agent.create_execution()`, or Agent process streaming. Treat local smoke scripts in that directory as infrastructure checks only; model-app or acceptance claims still require real DeepSeek or local Ollama examples. For the 4.1.2.5 foundation line, treat `examples/cookbook/`, `examples/action_runtime/`, `examples/execution_resource/`, `examples/builtin_actions/`, `examples/trigger_flow/`, `examples/dynamic_task/`, and `examples/fastapi/` as the recommended starting surfaces. Treat `examples/archived/` as compatibility reference only.
 
 When reporting API, recommended usage, examples, or compatibility changes, include concise sample code that shows the updated usage shape. Prefer current usage snippets or before/after snippets over abstract prose when that makes the change easier to inspect.
 

@@ -18,7 +18,8 @@ import inspect
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Callable, Coroutine, Literal, ParamSpec, TypeVar, cast, get_args, get_origin, get_type_hints
 
-from agently.core.execution.Action import ActionDispatcher, ActionRegistry
+from agently.core.operation.Action import ActionDispatcher, ActionRegistry
+from agently.core.operation.Action.ActionMetadata import sanitize_action_spec_for_metadata, summarize_action_records
 from agently.types.plugins import ToolManager
 from agently.utils import DataFormatter, DeprecationWarnings, FunctionShifter, LazyImport, SettingsNamespace
 from agently.utils.MCP import normalize_mcp_transport
@@ -251,8 +252,21 @@ class AgentlyToolManager(ToolManager):
             spec = self.action_registry.get_spec(action_id)
             if spec is None:
                 continue
-            action_info[action_id] = dict(spec)
+            action_info[action_id] = sanitize_action_spec_for_metadata(spec)
         return action_info
+
+    def summarize_records(
+        self,
+        records: list[dict[str, Any]] | None,
+        *,
+        validation_command_markers: list[str] | tuple[str, ...] | None = None,
+        validation_command_predicate: Callable[[str, dict[str, Any]], bool] | None = None,
+    ):
+        return summarize_action_records(
+            records,
+            validation_command_markers=validation_command_markers,
+            validation_command_predicate=validation_command_predicate,
+        )
 
     def get_tool_info(self, tags: str | list[str] | None = None):
         tool_info: dict[str, dict[str, Any]] = {}
@@ -384,7 +398,7 @@ class AgentlyToolManager(ToolManager):
         replay_safe: bool = True,
         expose_to_model: bool = True,
     ):
-        LazyImport.import_package("fastmcp", version_constraint=">=3")
+        LazyImport.import_package("fastmcp", version_constraint=">=3", auto_install=False)
         from fastmcp import Client
 
         transport = normalize_mcp_transport(transport, headers=headers)

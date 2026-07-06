@@ -18,6 +18,7 @@ import json5
 from pathlib import Path
 
 from typing import Any
+from typing_extensions import Self
 from json import JSONDecodeError
 
 from agently.core import BaseAgent
@@ -40,10 +41,10 @@ class ConfigurePromptExtension(BaseAgent):
         save_to: str | Path | None = None,
         *,
         encoding: str | None = "utf-8",
-    ):
+    ) -> str:
         prompt_data = {
             ".agent": self.agent_prompt.to_serializable_prompt_data(),
-            ".request": self.request_prompt.to_serializable_prompt_data(),
+            ".execution": self.request_prompt.to_serializable_prompt_data(),
         }
         content = json5.dumps(
             prompt_data,
@@ -61,10 +62,10 @@ class ConfigurePromptExtension(BaseAgent):
         save_to: str | Path | None = None,
         *,
         encoding: str | None = "utf-8",
-    ):
+    ) -> str:
         prompt_data = {
             ".agent": self.agent_prompt.to_serializable_prompt_data(),
-            ".request": self.request_prompt.to_serializable_prompt_data(),
+            ".execution": self.request_prompt.to_serializable_prompt_data(),
         }
         content = yaml.safe_dump(
             prompt_data,
@@ -82,7 +83,7 @@ class ConfigurePromptExtension(BaseAgent):
         if isinstance(output_prompt_value, dict):
             output_type = None
             output_desc = None
-            output_ensure = False
+            output_ensure_marker = None
             if "$type" in output_prompt_value:
                 output_type = output_prompt_value["$type"]
             if ".type" in output_prompt_value:
@@ -92,21 +93,21 @@ class ConfigurePromptExtension(BaseAgent):
             if ".desc" in output_prompt_value:
                 output_desc = output_prompt_value[".desc"]
             if "$ensure" in output_prompt_value:
-                output_ensure = DataPathBuilder.is_ensure_marker(output_prompt_value["$ensure"])
+                output_ensure_marker = DataPathBuilder.normalize_ensure_marker(output_prompt_value["$ensure"])
             if ".ensure" in output_prompt_value:
-                output_ensure = DataPathBuilder.is_ensure_marker(output_prompt_value[".ensure"])
+                output_ensure_marker = DataPathBuilder.normalize_ensure_marker(output_prompt_value[".ensure"])
             if "$default" in output_prompt_value or ".default" in output_prompt_value:
                 raise ValueError(
                     "Agently output prompt config no longer supports $default/.default. "
                     "Use $ensure for required fields."
                 )
-            if output_type is not None or output_desc is not None or output_ensure:
+            if output_type is not None or output_desc is not None or output_ensure_marker is not None:
                 resolved_type = self._generate_output_value(output_type) if output_type is not None else Any
-                if output_ensure:
+                if output_ensure_marker is not None:
                     return (
                         resolved_type,
                         output_desc,
-                        True,
+                        output_ensure_marker,
                     )
                 return (
                     resolved_type,
@@ -148,17 +149,36 @@ class ConfigurePromptExtension(BaseAgent):
             return
         setter(prompt_key, prompt_value, mappings=mappings)
 
-    def _apply_turn_prompt_config(self, prompt_value: Any, variable_mappings: dict[str, Any] | None):
+    def _set_pending_execution_prompt(
+        self,
+        key: str,
+        value: Any,
+        *,
+        mappings: dict[str, Any] | None = None,
+    ) -> Self:
+        self.request_prompt.set(key, value, mappings=mappings)
+        return self
+
+    def set_execution_prompt(
+        self,
+        key: str,
+        value: Any,
+        *,
+        mappings: dict[str, Any] | None = None,
+    ) -> Self:
+        return self._set_pending_execution_prompt(key, value, mappings=mappings)
+
+    def _apply_execution_prompt_config(self, prompt_value: Any, variable_mappings: dict[str, Any] | None):
         if isinstance(prompt_value, dict):
             for request_prompt_key, request_prompt_value in prompt_value.items():
                 self._set_configured_prompt_value(
-                    self.set_turn_prompt,
+                    self._set_pending_execution_prompt,
                     request_prompt_key,
                     request_prompt_value,
                     mappings=variable_mappings,
                 )
         else:
-            self.set_turn_prompt(
+            self._set_pending_execution_prompt(
                 "input",
                 prompt_value,
                 mappings=variable_mappings,
@@ -182,8 +202,10 @@ class ConfigurePromptExtension(BaseAgent):
                             prompt_value,
                             mappings=variable_mappings,
                         )
+                case ".execution":
+                    self._apply_execution_prompt_config(prompt_value, variable_mappings)
                 case ".request" | ".turn":
-                    self._apply_turn_prompt_config(prompt_value, variable_mappings)
+                    raise ValueError("Prompt config .request and .turn are removed; use .execution instead.")
                 case ".alias":
                     if isinstance(prompt_value, dict):
                         for alias_name, alias_parameters in prompt_value.items():
@@ -241,7 +263,7 @@ class ConfigurePromptExtension(BaseAgent):
                         )
                     else:
                         self._set_configured_prompt_value(
-                            self.set_turn_prompt,
+                            self._set_pending_execution_prompt,
                             prompt_key,
                             prompt_value,
                             mappings=variable_mappings,
@@ -254,7 +276,7 @@ class ConfigurePromptExtension(BaseAgent):
         mappings: dict[str, Any] | None = None,
         prompt_key_path: str | None = None,
         encoding: str | None = "utf-8",
-    ):
+    ) -> Self:
         path = Path(path_or_content)
         if self._is_existing_file_path(path_or_content):
             try:
@@ -290,7 +312,7 @@ class ConfigurePromptExtension(BaseAgent):
         mappings: dict[str, Any] | None = None,
         prompt_key_path: str | None = None,
         encoding: str | None = "utf-8",
-    ):
+    ) -> Self:
         path = Path(path_or_content)
         if self._is_existing_file_path(path_or_content):
             try:

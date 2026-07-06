@@ -73,6 +73,25 @@ reviewer 需要确认 release note 描述的是本次真正交付的最终产品
 需要做小范围 API / 文档调整，必须先回到 release PR 内完成修改，重新运行相关验证，再
 合并。不要先合并，再把 release-note 修正当作后续 marketing 补丁。
 
+## 升级信息呈现格式
+
+所有面向用户的升级说明都必须同时包含样例代码和核心变动表。这个要求适用于
+release notes、release PR body、issue closeout comment、面向维护者的升级摘要，以及
+解释新增或变更 public surface 的 docs 页面。
+
+样例代码必须展示当前推荐用法。如果 API 形态发生变化，要给出 before/after snippet。
+如果本次升级没有可调用 API，则展示相关配置、CLI 命令、manifest entry 或 workflow YAML。
+除非明确标注为 conceptual，否则不要用 pseudo-code。
+
+核心变动表至少包含这些列：
+
+| 领域 | 变动内容 | 推荐用法 | 兼容性 / 风险 | 证据 |
+|---|---|---|---|---|
+| Public API / docs / runtime area | 用户可见行为或契约 | 方法、配置、命令或 example path | Additive、breaking、policy-gated、deferred 或 no-op | Tests、examples、specs、compatibility metadata 或 companion validation |
+
+如果某个声明的切片只完成了部分实现，表格里必须包含一行 deferred，写明剩余范围以及
+承接它的 spec 或 issue。不要把延期工作藏在表格之后的散文里。
+
 ## 验收论证
 
 推荐 release 前，必须为每个用户可见的功能切片写一份 coverage-first 的验收论证。
@@ -89,6 +108,8 @@ compatibility manifest、docs 和 example 规则里的要求，然后把每一�
 - docs、compatibility manifest、spec reconciliation 和 companion guidance
 - 如果 runtime event、observation payload、lineage 或 companion protocol 变化，还需要
   DevTools 或其他 companion validation
+- 当 public API、data contract、stream payload、callback、handler、facade 或
+  companion package surface 发生变化时，还需要公开 typing 与 IDE metadata 检查
 
 example 用来证明 release 解决了真实场景，但不能单独证明兼容行为、protocol 边界、
 route lifecycle、错误语义、budget counting 或内部架构归属。如果某个要求没有证据，
@@ -98,6 +119,55 @@ claim。
 release PR body 或 review notes 应包含这张覆盖矩阵，或给出简洁链接。不能在没有先检查
 证据覆盖目标合同的情况下，直接用已有 examples、tests 或已关闭 issue 作为 release
 验收结论。
+
+## 公开 Typing 与 IDE 支持
+
+公开 typing 完备度是 release gate。框架发版必须保证源码 checkout 和已安装包都能为
+Pylance / pyright 兼容 IDE 提供可用提示。
+
+发版前必须：
+
+- 在运行 `pytest` 前，用 release candidate 解释器对 `agently/`、`tests/` 和
+  `examples/` 运行 `pyright`
+- 审查本次变更触及的 public surface，确认没有缺失 annotation，也没有未说明理由的宽
+  `Any`
+- 确认源码树包含 `agently/py.typed`，并且构建产物或已安装候选包也包含该文件
+- 在仓库源码路径之外，对已安装候选包运行一次等价于 Pylance 的 `pyright` smoke，
+  导入代表性的 root public API 和本次变更的 public surface
+- 在 release PR body 或 review notes 中记录命令、解释器、包来源和结果
+
+如果本次 release 同时发布或推荐 companion Python package，例如 `agently-devtools`，
+还必须对该 companion 执行同样的源码与已安装包 typing / IDE smoke，再声明 release
+line 已对齐。
+
+## Foundation Example Effect Gate
+
+Foundation 层能力是 release-critical framework substrate，不是应用层 use case。
+典型例子包括 ModelRequest/ModelResponse、TriggerFlow、Dynamic Task/TaskDAG、
+ActionRuntime、ExecutionResource、Workspace/ContextBuilder/ContextPackage、RuntimeEvent/EventCenter
+和 provider protocols。当某个 release 触及或声称这类 substrate 能力时，仅有测试通过
+还不够：release reviewer 还必须运行 `examples/` 下对应的核心 example，确认真实效果
+仍然能通过推荐 public API 跑通。
+
+AgentExecution、AgentTask、Skills workflows 和业务示例可以作为 release use-case
+checks，但它们本身不是 Foundation checks。只有当 release 同时触及它们依赖的
+Foundation substrate，例如 ModelRequest result materialization、TriggerFlow lifecycle
+或 Dynamic Task DAG execution 时，才映射到这个 gate。
+
+对每个受影响的 Foundation 能力：
+
+- 写明被保护的 Foundation 能力和用户可见效果
+- 列出证明该效果的 runnable core example；如果没有，必须先补 example 再 release
+- 在 pyright 和 pytest 之后，用 release candidate 运行该 example
+- 如果效果包含模型拥有的 planning、routing、verification 或 response generation，必须使用
+  真实 DeepSeek 或本地 Ollama
+- 在 release PR body 或 review notes 中记录 command、environment，以及稳定 key output、
+  artifact、stream、metadata 或 side-effect 证据
+
+这个 gate fail closed。不要在 Foundation example effect check 缺失或失败时，仅凭
+unit tests passed 发布。必须修复 example 或 release candidate，移除 release claim，在
+spec 和 release note 中明确延期受影响的 Foundation 能力，或由 maintainer 记录一次性
+waiver 和残余风险。
 
 ## Release PR 正文
 
@@ -110,6 +180,8 @@ history 里拼接事实，就能判断 release 是否可以接受或必须阻塞
 - 按用户可见能力分组的变更摘要
 - coverage-first 验收论证或覆盖矩阵
 - validation commands 和结果，包括被跳过或失败的检查
+- 源码与已安装候选包的公开 typing 以及 Pylance / pyright IDE metadata 检查
+- 涉及 Foundation 层能力时的 Foundation example effect checks
 - clean install smoke 的环境和结果
 - compatibility manifest 更新和 companion repository 状态
 - 如果 runtime events、observation payload、lineage 或 DevTools 代码变化，需要写明

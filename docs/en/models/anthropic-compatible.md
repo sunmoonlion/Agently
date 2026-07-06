@@ -20,6 +20,7 @@ Agently.set_settings("AnthropicCompatible", {
     "api_key": "${ENV.ANTHROPIC_API_KEY}",
     "model": "${ENV.ANTHROPIC_MODEL}",
     "max_tokens": 4096,
+    "stream_idle_timeout": 45.0,
 })
 ```
 
@@ -31,6 +32,7 @@ Agently.set_settings("AnthropicCompatible", {
 | `max_tokens` | **required** by the Anthropic API; defaults sensibly but pin it for predictable cost |
 | `anthropic_version` | API version header (defaults to a recent stable version) |
 | `anthropic_beta` | optional beta-feature header (string or list of strings) |
+| `stream_idle_timeout` | optional liveness deadline for streaming gaps and non-streaming response materialization |
 | `request_options` | extra dict forwarded to the underlying HTTP client |
 
 The public coordinator lives at [agently/builtins/plugins/ModelRequester/AnthropicCompatible/plugin.py](../../../agently/builtins/plugins/ModelRequester/AnthropicCompatible/plugin.py), with private implementation modules under `modules/`.
@@ -62,7 +64,7 @@ agent.set_settings("AnthropicCompatible", {"model": "${ENV.ANTHROPIC_MODEL_FAST}
 
 ## Streaming
 
-`response.get_generator(type="delta")` / `get_async_generator(type="delta")` yields incremental text. `type="instant"` for structured streaming works the same way as on `OpenAICompatible` — the difference is purely upstream parsing.
+`result.get_generator(type="delta")` / `get_async_generator(type="delta")` yields incremental text. `type="instant"` for structured streaming works the same way as on `OpenAICompatible` — the difference is purely upstream parsing.
 
 ## Beta features
 

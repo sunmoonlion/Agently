@@ -119,8 +119,8 @@ If a UI displays partial results as they're generated, push each requirement's c
 ```python
 async def cases_for_one(data):
     req = data.input
-    response = agent.info({"requirement": req}, always=False).input("...").output({...}).get_response()
-    async for item in response.get_async_generator(type="instant"):
+    result = agent.info({"requirement": req}, always=False).input("...").output({...}).get_result()
+    async for item in result.get_async_generator(type="instant"):
         if item.delta:
             await data.async_put_into_stream({
                 "req_id": req["id"],
@@ -128,7 +128,7 @@ async def cases_for_one(data):
                 "delta": item.delta,
                 "done": item.is_complete,
             })
-    return await response.async_get_data()
+    return await result.async_get_data()
 ```
 
 The consumer of `execution.get_async_runtime_stream(...)` sees per-requirement, per-field progress. See [Events and Streams](../triggerflow/events-and-streams.md).
@@ -151,7 +151,7 @@ This works at the per-chunk level — applying it across the consolidate output 
 
 ### Save and resume on long PRDs
 
-For very long PRDs (50+ requirements), the run can be long enough to want checkpointing. Switch to `flow.create_execution(auto_close=False)`, save after `list_requirements`, and resume to pick up the for_each. See [Persistence and Blueprint](../triggerflow/persistence-and-blueprint.md).
+For very long PRDs (50+ requirements), the run can be long enough to want execution snapshot persistence. Switch to `flow.create_execution(auto_close=False)`, save after `list_requirements`, and resume to pick up the for_each. See [Persistence and Blueprint](../triggerflow/persistence-and-blueprint.md).
 
 ## Cross-links
 

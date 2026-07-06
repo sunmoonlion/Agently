@@ -32,11 +32,20 @@ should be added here; new plugin Protocols belong in their own file.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable
 from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
 
-from agently.types.data import SkillContract, SkillExecutionPlan, SkillMode, SkillsPackRecord
+from agently.types.data import (
+    ModelStreamingHandler,
+    SkillContract,
+    SkillContextPack,
+    SkillContextPackIncludeMode,
+    SkillExecutionPlan,
+    SkillActivation,
+    SkillMode,
+    SkillsPackRecord,
+)
 
 
 @runtime_checkable
@@ -54,7 +63,7 @@ class SkillsPlanningContext(Protocol):
         output_format: Literal["json", "flat_markdown", "hybrid", "xml_field", "yaml_literal", "auto"] | None = None,
         ensure_keys: list[str] | None = None,
         max_retries: int = 3,
-        stream_handler: Callable[[Any], Awaitable[None] | None] | None = None,
+        stream_handler: ModelStreamingHandler | None = None,
     ) -> Any: ...
 
 
@@ -84,7 +93,7 @@ class SkillsExecutionContext(SkillsPlanningContext, Protocol):
     # ── Controlled side effects; None when not granted ──
 
     @property
-    def execution_environment(self) -> Any | None: ...
+    def execution_resource(self) -> Any | None: ...
 
 
 @runtime_checkable
@@ -179,6 +188,63 @@ class SkillsExecutor(Protocol):
     def inspect_skills_pack(self, skills_pack_id: str) -> SkillsPackRecord: ...
 
     def read_resource(self, skill_id: str, path: str, *, max_bytes: int = 262144) -> str: ...
+
+    def capability_adapter(self) -> Any: ...
+
+    def discover_skill_capabilities(self, *, limit: int | None = None) -> list[dict[str, Any]]: ...
+
+    def activate_skill(
+        self,
+        skill_id: str,
+        *,
+        task: str | None = None,
+        budget_chars: int = 4000,
+    ) -> SkillActivation: ...
+
+    def build_context_pack(
+        self,
+        *,
+        context: SkillsPlanningContext | None = None,
+        task: str | None = None,
+        intent: str | None = None,
+        skill_ids: list[str] | tuple[str, ...] | None = None,
+        skills: Any = None,
+        skills_packs: Any = None,
+        include_guidance: bool = True,
+        include_examples: SkillContextPackIncludeMode = "auto",
+        include_references: SkillContextPackIncludeMode = "auto",
+        include_assets: SkillContextPackIncludeMode = False,
+        include_public_lookup: bool = False,
+        actionize_scripts: bool = False,
+        budget_chars: int = 12000,
+        max_resource_chars: int = 6000,
+    ) -> SkillContextPack: ...
+
+    async def async_build_context_pack(
+        self,
+        *,
+        context: SkillsPlanningContext | None = None,
+        task: str | None = None,
+        intent: str | None = None,
+        skill_ids: list[str] | tuple[str, ...] | None = None,
+        skills: Any = None,
+        skills_packs: Any = None,
+        include_guidance: bool = True,
+        include_examples: SkillContextPackIncludeMode = "auto",
+        include_references: SkillContextPackIncludeMode = "auto",
+        include_assets: SkillContextPackIncludeMode = False,
+        include_public_lookup: bool = False,
+        actionize_scripts: bool = False,
+        budget_chars: int = 12000,
+        max_resource_chars: int = 6000,
+    ) -> SkillContextPack: ...
+
+    def task_dag_resolver(
+        self,
+        *,
+        context: SkillsPlanningContext | None = None,
+        defaults: dict[str, Any] | None = None,
+    ) -> dict[str, Any]: ...
 
     def remove_skills(self, skill_id: str) -> dict[str, Any]: ...
 

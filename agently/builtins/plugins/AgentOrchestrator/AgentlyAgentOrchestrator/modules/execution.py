@@ -15,70 +15,166 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import time
 import uuid
+from pathlib import Path
 from collections.abc import AsyncGenerator, Generator
-from typing import Any, Literal, TYPE_CHECKING
+from typing import Any, Literal, TYPE_CHECKING, cast
+
+import json5
+import yaml
 
 from agently.core.application.AgentExecution import (
     AgentExecutionContext,
-    AgentExecutionLimitExceeded,
+    AgentExecutionPromptDraft,
+    AgentExecutionResult,
     AgentExecutionStream,
     RuntimeStageStallError,
     merge_stream_meta,
     normalize_execution_limits,
     normalize_execution_lineage,
-    normalize_execution_mode,
 )
-from agently.core.runtime.RuntimeContext import bind_runtime_context
 from agently.types.data import AgentExecutionStreamData
-from agently.types.options import normalize_execution_options
 from agently.utils import DataFormatter, FunctionShifter
 
+from .bridges import (
+    bridge_model_stream_item as bridge_model_stream_item_entry,
+    bridge_task_dag_stream_item as bridge_task_dag_stream_item_entry,
+    record_action_log as record_action_log_entry,
+    record_model_response_id as record_model_response_id_entry,
+)
+from .diagnostics import (
+    build_execution_meta,
+    initial_diagnostics,
+    initial_workspace_refs,
+    record_error_diagnostic,
+    refresh_diagnostics,
+)
+from .limits import (
+    await_route_with_limits,
+    build_execution_stall_error,
+    cancel_limited_task,
+)
+from .result_views import (
+    async_get_data as async_get_data_entry,
+    async_get_meta as async_get_meta_entry,
+    async_get_text as async_get_text_entry,
+    get_async_generator as get_async_generator_entry,
+    sync_generator as sync_generator_entry,
+)
+from .route_execution import async_execute_route, start_execution
 from .routing import HybridRoutePlanner
-from .routes import run_dynamic_task_route, run_model_request_route, run_skills_route
+from .state import (
+    ExecutionOptionsState,
+    apply_strategy_selection,
+    apply_effort_strategy_limits,
+    build_effective_options,
+    configure_effort,
+    configure_execution_options,
+    is_task_strategy as state_is_task_strategy,
+    load_strategy_state_from_options,
+    normalize_options_state,
+    record_consumed_option as state_record_consumed_option,
+    route_options as state_route_options,
+    set_execution_goals,
+    set_success_criteria,
+    task_goal as state_task_goal,
+    task_success_criteria as state_task_success_criteria,
+    task_target as state_task_target,
+)
+from .workspace_records import (
+    append_workspace_ref,
+    default_checkpoint_state,
+    default_workspace_content,
+    default_workspace_summary,
+    record_workspace as record_workspace_entry,
+    workspace_scope,
+    workspace_source,
+)
 
 if TYPE_CHECKING:
     from agently.core.Agent import BaseAgent
     from agently.types.data import (
         AgentExecutionLineage,
         AgentExecutionLimits,
-        AgentExecutionMode,
         OutputValidateHandler,
         RunContext,
+        SkillExecutionPlan,
     )
+    from agently.core.application import DynamicTask
 
 
 class AgentExecution:
-    """Response-style execution facade for one Agent turn."""
+    """Unified execution draft, run owner, and result source for one Agent run."""
 
     def __init__(
         self,
         agent: "BaseAgent",
         *,
-        mode: "AgentExecutionMode | str" = "one_turn",
         lineage: "AgentExecutionLineage | dict[str, Any] | None" = None,
         limits: "AgentExecutionLimits | dict[str, Any] | None" = None,
         options: Any = None,
         parent_run_context: "RunContext | None" = None,
+        request: Any = None,
     ):
-        self.agent = agent
+        self.agent = getattr(agent, "_agent", agent)
+        self.request = self._resolve_request(agent, request)
+        self.request_prompt = self.request.prompt
+        self.prompt = self.request_prompt
+        self._draft = AgentExecutionPromptDraft(self.agent, self.request)
         self.id = uuid.uuid4().hex
-        self.mode: "AgentExecutionMode" = normalize_execution_mode(str(mode))
         self.lineage: "AgentExecutionLineage" = normalize_execution_lineage(lineage)
-        self.limits: "AgentExecutionLimits" = normalize_execution_limits(limits, mode=self.mode)
-        self.options: dict[str, Any] = normalize_execution_options(options)
-        self.effective_options: dict[str, Any] = self._build_effective_options()
+        self.limits: "AgentExecutionLimits" = normalize_execution_limits(limits)
+        self._effort_applied_limits: set[str] = set()
+        self.options: ExecutionOptionsState = normalize_options_state(self, options)
+        self.task_refs: dict[str, Any] = {}
+        self.task_record: Any = None
+        self.goal_items: list[str] = []
+        self.success_criteria_items: list[str] = []
+        self.generated_success_criteria: list[str] = []
+        self.local_action_ids: list[str] = []
+        self.local_required_action_ids: list[str] = []
+        self.local_skill_selectors: list[dict[str, Any]] = []
+        self.local_skills_pack_selectors: list[dict[str, Any]] = []
+        self._agent_task_step_overrides: dict[str, Any] = {}
+        self.task_options: dict[str, Any] = {}
+        self.strategy_name: str | None = None
+        self.inherited_task_execution_strategy: str | None = None
+        self.inherited_effective_task_execution_strategy: str | None = None
+        self.inherited_strategy_context_source: str | None = None
+        self.effective_options: dict[str, Any] = {}
         self.consumed_options: dict[str, Any] = {}
-        self.workspace = getattr(agent, "workspace", None)
+        self.workspace: Any = getattr(self.agent, "workspace", None)
+        # Bind the execution file root from the full resolved scope chain instead
+        # of a lineage-scoped execution file root. The effective parent scope is
+        # known at construction via ``self.lineage`` (parent task and/or parent
+        # execution), so the execution nests under its real ancestors and shares
+        # a single prunable lineage subtree with them (spec sections 8.2 / 9).
+        with_scope_lineage = getattr(self.workspace, "with_scope_lineage", None)
+        if callable(with_scope_lineage):
+            lineage_nodes: list[dict[str, Any]] = []
+            parent_task_id = self.lineage.get("task_id")
+            if parent_task_id:
+                lineage_nodes.append({"kind": "tasks", "id": str(parent_task_id)})
+            parent_execution_id = self.lineage.get("parent_execution_id")
+            if parent_execution_id:
+                lineage_nodes.append({"kind": "executions", "id": str(parent_execution_id)})
+            lineage_nodes.append({"kind": "executions", "id": self.id})
+            self.workspace = with_scope_lineage(lineage_nodes)
+        self._nesting_depth, self._nesting_budget = self._resolve_nesting_state()
+        self._load_inherited_strategy_context()
         self.execution_context = AgentExecutionContext(
             execution_id=self.id,
-            mode=self.mode,
             lineage=self.lineage,
             limits=self.limits,
+            nesting_depth=self._nesting_depth,
+            nesting_budget=self._nesting_budget,
+            task_execution_strategy=self.inherited_task_execution_strategy,
+            effective_task_execution_strategy=self.inherited_effective_task_execution_strategy,
+            strategy_context_source=self.inherited_strategy_context_source,
         )
         self.parent_run_context = parent_run_context
+        self.agent_execution_run_context: "RunContext | None" = None
+        self._agent_execution_started_emitted = False
         self.route_info: dict[str, Any] = {}
         self.route_plan: dict[str, Any] = {}
         self.close_snapshot: dict[str, Any] = {}
@@ -88,22 +184,25 @@ class AgentExecution:
             "artifact_refs": [],
             "route_logs": {},
         }
-        self.diagnostics: dict[str, Any] = {}
-        self.workspace_refs: dict[str, Any] = {}
+        self.diagnostics: dict[str, Any] = initial_diagnostics()
+        self.workspace_refs: dict[str, Any] = initial_workspace_refs()
+        self._load_strategy_state_from_options()
+        self.effective_options = self._build_effective_options()
+        apply_effort_strategy_limits(self)
+        self.effective_options = self._build_effective_options()
         self.result: Any = None
         self.status = "created"
-        prompt_snapshot = agent.request.prompt.get()
-        self.prompt_snapshot: dict[str, Any] = prompt_snapshot if isinstance(prompt_snapshot, dict) else {}
+        self.prompt_snapshot: dict[str, Any] = self._snapshot_prompt()
 
         self._started = False
         self._completed = False
         self._start_lock = asyncio.Lock()
-        self.route_planner = HybridRoutePlanner(agent, prompt_snapshot=self.prompt_snapshot)
+        self.route_planner = HybridRoutePlanner(self.agent, prompt_snapshot=self.prompt_snapshot, execution=self)
         self.stream = AgentExecutionStream(
             execution_id=self.id,
-            execution_mode=self.mode,
             lineage=self.lineage,
-        )
+        ).bind_execution(self)
+        self.execution_context.set_progress_callback(self._publish_runtime_progress)
         self._error: BaseException | None = None
         self._selected_route: tuple[str, dict[str, Any]] | None = None
         self._seen_action_log_keys: set[str] = set()
@@ -114,36 +213,590 @@ class AgentExecution:
         self.get_meta = FunctionShifter.syncify(self.async_get_meta)
         self.record_workspace = FunctionShifter.syncify(self.async_record_workspace)
         self.get_generator = self._get_generator
+        self.run = self._compat_run
+        self.async_run = self.async_start
+        self.meta = self._compat_meta
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self.agent, name)
+        if not callable(attr):
+            return attr
+
+        def wrapper(*args: Any, **kwargs: Any):
+            result = attr(*args, **kwargs)
+            return self if result is self.agent else result
+
+        return wrapper
+
+    def _resolve_request(self, agent: Any, request: Any):
+        if request is not None:
+            return request
+        if getattr(agent, "_agent", None) is not None:
+            return agent.request
+        isolated_request = self.agent.create_request()
+        pending_prompt = self.agent._snapshot_request_prompt()
+        if pending_prompt:
+            isolated_request.prompt.update(pending_prompt)
+            self.agent.request.prompt.clear()
+        return isolated_request
+
+    def _snapshot_prompt(self) -> dict[str, Any]:
+        prompt_snapshot = self.request.prompt.get()
+        return dict(prompt_snapshot) if isinstance(prompt_snapshot, dict) else {}
+
+    def _refresh_prompt_snapshot(self):
+        self.prompt_snapshot = self._snapshot_prompt()
+        self.route_planner.prompt_snapshot = dict(self.prompt_snapshot)
+        self._selected_route = None
+        return self
+
+    def _load_strategy_state_from_options(self):
+        load_strategy_state_from_options(self)
+
+    def _resolve_nesting_state(self) -> tuple[int, int | None]:
+        """Compute this execution's nesting depth and the effective nesting budget.
+
+        Depth is one deeper than the currently bound parent AgentExecutionContext
+        (root = 0). The budget is the most restrictive `max_nested_agent_steps`
+        among the constraining ancestor and this execution's own limits.
+        """
+        from agently.core.runtime.RuntimeContext import get_current_agent_execution_context
+
+        parent_context = get_current_agent_execution_context()
+        parent_depth = getattr(parent_context, "nesting_depth", None)
+        depth = parent_depth + 1 if isinstance(parent_depth, int) else 0
+        own_budget = self.limits.get("max_nested_agent_steps")
+        parent_budget = getattr(parent_context, "nesting_budget", None)
+        budgets = [value for value in (parent_budget, own_budget) if isinstance(value, int)]
+        budget = min(budgets) if budgets else None
+        return depth, budget
+
+    def _load_inherited_strategy_context(self):
+        from agently.core.runtime.RuntimeContext import get_current_agent_execution_context
+
+        parent_context = get_current_agent_execution_context()
+        self.inherited_task_execution_strategy = getattr(parent_context, "task_execution_strategy", None)
+        self.inherited_effective_task_execution_strategy = getattr(
+            parent_context,
+            "effective_task_execution_strategy",
+            None,
+        )
+        self.inherited_strategy_context_source = getattr(parent_context, "strategy_context_source", None)
+        return self
+
+    def _replace_runtime_context(self):
+        self._nesting_depth, self._nesting_budget = self._resolve_nesting_state()
+        self._load_inherited_strategy_context()
+        self.execution_context = AgentExecutionContext(
+            execution_id=self.id,
+            lineage=self.lineage,
+            limits=self.limits,
+            nesting_depth=self._nesting_depth,
+            nesting_budget=self._nesting_budget,
+            task_execution_strategy=self.inherited_task_execution_strategy,
+            effective_task_execution_strategy=self.inherited_effective_task_execution_strategy,
+            strategy_context_source=self.inherited_strategy_context_source,
+        )
+        self.stream = AgentExecutionStream(
+            execution_id=self.id,
+            lineage=self.lineage,
+        ).bind_execution(self)
+        self.execution_context.set_progress_callback(self._publish_runtime_progress)
+        self._selected_route = None
+        self.route_info = {}
+        self.route_plan = {}
+        self.effective_options = self._build_effective_options()
 
     def _build_effective_options(self) -> dict[str, Any]:
-        effective = dict(self.options)
-        execution_options = effective.get("execution")
-        execution_options = dict(execution_options) if isinstance(execution_options, dict) else {}
-        execution_options.update(
-            {
-                "mode": self.mode,
-                "lineage": self.lineage,
-                "limits": self.limits,
-            }
+        return build_effective_options(self)
+
+    async def _publish_runtime_progress(self, event: dict[str, Any]):
+        stage = str(event.get("stage") or "runtime").strip() or "runtime"
+        status = str(event.get("status") or "progress").strip() or "progress"
+        path_stage = stage.replace("/", ".").replace(" ", "_")
+        path_status = status.replace("/", ".").replace(" ", "_")
+        await self.stream.emit(
+            f"runtime.progress.{path_stage}.{path_status}",
+            event,
+            route=str(self.route_info.get("selected_route") or ""),
+            source="agent_execution",
+            meta={
+                "stream_kind": "runtime_progress",
+                "event_type": event.get("event_type"),
+                "stage": stage,
+                "status": status,
+            },
         )
-        effective["execution"] = execution_options
-        return effective
+
+    def _ensure_agent_execution_run_context(self) -> "RunContext":
+        if self.agent_execution_run_context is None:
+            self.agent_execution_run_context = self.agent._create_agent_execution_run_context(
+                parent_run_context=self.parent_run_context,
+                execution_id=self.id,
+                meta={
+                    "execution_id": self.id,
+                    "strategy": self.strategy_name,
+                    "lineage": DataFormatter.sanitize(self.lineage),
+                },
+            )
+        assert self.agent_execution_run_context is not None
+        return self.agent_execution_run_context
+
+    async def _async_emit_agent_execution_started_once(self) -> "RunContext":
+        run_context = self._ensure_agent_execution_run_context()
+        if not self._agent_execution_started_emitted:
+            await self.agent._async_emit_agent_execution_started(run_context)
+            self._agent_execution_started_emitted = True
+        return run_context
+
+    async def _async_emit_agent_execution_terminal_event(self, *, failed: bool = False) -> None:
+        if self.agent_execution_run_context is None:
+            return
+        await self.agent._async_emit_agent_execution_terminal_event(
+            self.agent_execution_run_context,
+            execution_id=self.id,
+            status=self.status,
+            route=cast(str | None, self.route_info.get("selected_route")),
+            strategy=self.strategy_name,
+            task_refs=self.task_refs,
+            close_snapshot=self.close_snapshot,
+            failed=failed,
+        )
+
+    async def _async_emit_stream_runtime_event(self, item: AgentExecutionStreamData) -> None:
+        if self.agent_execution_run_context is None:
+            return
+        await self.agent._async_emit_agent_execution_stream_event(
+            self.agent_execution_run_context,
+            execution_id=self.id,
+            item=item,
+            execution_strategy=cast(str | None, self.task_refs.get("execution_strategy") or self.task_options.get("execution")),
+            effective_execution_strategy=cast(str | None, self.task_refs.get("effective_execution_strategy")),
+        )
+
+    def configure_options(self, options: Any) -> "AgentExecution":
+        return configure_execution_options(self, options)
+
+    def create_execution(
+        self,
+        *,
+        lineage: "AgentExecutionLineage | dict[str, Any] | None" = None,
+        limits: "AgentExecutionLimits | dict[str, Any] | None" = None,
+        options: Any = None,
+        parent_run_context: "RunContext | None" = None,
+    ) -> "AgentExecution":
+        if self._started:
+            if any(value is not None for value in (lineage, limits, options, parent_run_context)):
+                raise RuntimeError("Cannot reconfigure an AgentExecution after it has started.")
+            return self
+        if lineage is not None:
+            self.lineage = normalize_execution_lineage(lineage)
+        self.limits = normalize_execution_limits(limits)
+        if options is not None:
+            self.configure_options(options)
+        if parent_run_context is not None:
+            self.parent_run_context = parent_run_context
+        self._replace_runtime_context()
+        return self
+
+    def get_result(self) -> AgentExecutionResult:
+        return AgentExecutionResult(self)
+
+    def get_response(self) -> AgentExecutionResult:
+        return self.get_result()
+
+    def _compat_run(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return self.start(*args, **kwargs)
+        return self.async_start(*args, **kwargs)
+
+    def _compat_meta(self, *args: Any, **kwargs: Any) -> Any:
+        if self.task_record is not None:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return self.task_record._meta()
+            return self.task_record.async_meta()
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return self.get_meta(*args, **kwargs)
+        return self.async_get_meta(*args, **kwargs)
+
+    async def async_meta(self) -> dict[str, Any]:
+        task_record = self.task_record
+        if task_record is not None:
+            return await task_record.async_meta()
+        await self.async_start()
+        task_record = self.task_record
+        if task_record is not None:
+            return await task_record.async_meta()
+        return await self.async_get_meta()
+
+    def set_execution_prompt(self, key: Any, value: Any, *, mappings: dict[str, Any] | None = None) -> "AgentExecution":
+        self._draft.set_execution_prompt(key, value, mappings=mappings)
+        return self._refresh_prompt_snapshot()
+
+    def remove_execution_prompt(self, key: Any) -> "AgentExecution":
+        self._draft.remove_execution_prompt(key)
+        return self._refresh_prompt_snapshot()
+
+    def validate(self, handler: "OutputValidateHandler") -> "AgentExecution":
+        self._draft.validate(handler)
+        return self
+
+    def system(self, prompt: Any, *, mappings: dict[str, Any] | None = None, always: bool = False) -> "AgentExecution":
+        self._draft.system(prompt, mappings=mappings, always=always)
+        return self._refresh_prompt_snapshot()
+
+    def rule(self, prompt: Any, *, mappings: dict[str, Any] | None = None, always: bool = False) -> "AgentExecution":
+        self._draft.rule(prompt, mappings=mappings, always=always)
+        return self._refresh_prompt_snapshot()
+
+    def role(self, *args: Any, **kwargs: Any) -> "AgentExecution":
+        self._draft.role(*args, **kwargs)
+        return self._refresh_prompt_snapshot()
+
+    def user_info(self, *args: Any, **kwargs: Any) -> "AgentExecution":
+        self._draft.user_info(*args, **kwargs)
+        return self._refresh_prompt_snapshot()
+
+    def input(self, *args: Any, **kwargs: Any) -> "AgentExecution":
+        self._draft.input(*args, **kwargs)
+        return self._refresh_prompt_snapshot()
+
+    def info(self, *args: Any, **kwargs: Any) -> "AgentExecution":
+        self._draft.info(*args, **kwargs)
+        return self._refresh_prompt_snapshot()
+
+    def instruct(self, *args: Any, **kwargs: Any) -> "AgentExecution":
+        self._draft.instruct(*args, **kwargs)
+        return self._refresh_prompt_snapshot()
+
+    def examples(self, *args: Any, **kwargs: Any) -> "AgentExecution":
+        self._draft.examples(*args, **kwargs)
+        return self._refresh_prompt_snapshot()
+
+    def output(self, *args: Any, **kwargs: Any) -> "AgentExecution":
+        self._draft.output(*args, **kwargs)
+        return self._refresh_prompt_snapshot()
+
+    def attachment(self, *args: Any, **kwargs: Any) -> "AgentExecution":
+        self._draft.attachment(*args, **kwargs)
+        return self._refresh_prompt_snapshot()
+
+    def image(self, *args: Any, **kwargs: Any) -> "AgentExecution":
+        self._draft.image(*args, **kwargs)
+        return self._refresh_prompt_snapshot()
+
+    def set_prompt_options(self, options: dict[str, Any], *, always: bool = False) -> "AgentExecution":
+        self._draft.set_prompt_options(options, always=always)
+        return self._refresh_prompt_snapshot()
+
+    def language(self, *args: Any, **kwargs: Any) -> "AgentExecution":
+        self._draft.language(*args, **kwargs)
+        return self._refresh_prompt_snapshot()
+
+    def use_dynamic_task(self, *args: Any, **kwargs: Any) -> "AgentExecution":
+        raise ValueError(
+            "AgentExecution.use_dynamic_task(...) is no longer an AgentExecution route. "
+            "Use Agently.create_dynamic_task(...) or direct TaskDAGExecutor(...) for "
+            "independent DAG workflows."
+        )
+
+    def resolve_skills_plan(self, *args: Any, **kwargs: Any) -> "SkillExecutionPlan":
+        kwargs = self._with_local_skill_kwargs(kwargs)
+        return self._draft.resolve_skills_plan(*args, **kwargs)
+
+    async def async_resolve_skills_plan(self, *args: Any, **kwargs: Any) -> "SkillExecutionPlan":
+        kwargs = self._with_local_skill_kwargs(kwargs)
+        return await self._draft.async_resolve_skills_plan(*args, **kwargs)
+
+    def run_skills_task(self, *args: Any, **kwargs: Any) -> Any:
+        kwargs = self._with_local_skill_kwargs(kwargs)
+        return self._draft.run_skills_task(*args, **kwargs)
+
+    async def async_run_skills_task(self, *args: Any, **kwargs: Any) -> Any:
+        kwargs = self._with_local_skill_kwargs(kwargs)
+        return await self._draft.async_run_skills_task(*args, **kwargs)
+
+    def _with_local_skill_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        updated = dict(kwargs)
+        mode = str(updated.get("mode") or "model_decision")
+        if "skills" not in updated:
+            selectors = [
+                item.get("selector")
+                for item in self.local_skill_selectors
+                if item.get("mode") == mode
+            ]
+            if selectors:
+                updated["skills"] = selectors
+        if "skills_packs" not in updated:
+            pack_selectors = [
+                item.get("selector")
+                for item in self.local_skills_pack_selectors
+                if item.get("mode") == mode
+            ]
+            if pack_selectors:
+                updated["skills_packs"] = pack_selectors
+        return updated
+
+    def create_dynamic_task(self, *args: Any, **kwargs: Any) -> "DynamicTask":
+        return self._draft.create_dynamic_task(*args, **kwargs)
+
+    def get_prompt_text(self) -> str:
+        return self._draft.get_prompt_text()
+
+    def get_json_prompt(
+        self,
+        save_to: str | Path | None = None,
+        *,
+        encoding: str | None = "utf-8",
+    ) -> str:
+        prompt_data = {
+            ".agent": self.agent.agent_prompt.to_serializable_prompt_data(),
+            ".execution": self.request_prompt.to_serializable_prompt_data(),
+        }
+        content = json5.dumps(
+            prompt_data,
+            indent=2,
+            ensure_ascii=False,
+        )
+        if save_to is not None:
+            target = Path(save_to)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding=encoding)
+        return content
+
+    def get_yaml_prompt(
+        self,
+        save_to: str | Path | None = None,
+        *,
+        encoding: str | None = "utf-8",
+    ) -> str:
+        prompt_data = {
+            ".agent": self.agent.agent_prompt.to_serializable_prompt_data(),
+            ".execution": self.request_prompt.to_serializable_prompt_data(),
+        }
+        content = yaml.safe_dump(
+            prompt_data,
+            indent=2,
+            allow_unicode=True,
+            sort_keys=False,
+        )
+        if save_to is not None:
+            target = Path(save_to)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding=encoding)
+        return content
+
+    def goal(self, goal: Any, success_criteria: Any = None) -> "AgentExecution":
+        if isinstance(goal, (list, tuple, set)):
+            set_execution_goals(self, tuple(goal))
+        else:
+            text = str(goal or "").strip()
+            if text:
+                set_execution_goals(self, (text,))
+        if success_criteria is not None:
+            set_success_criteria(self, success_criteria)
+        return self
+
+    goals = goal
+
+    def effort(self, value: Any = "medium", **strategy: Any) -> "AgentExecution":
+        return configure_effort(self, value, **strategy)
+
+    def use_actions(self, *args: Any, **kwargs: Any) -> "AgentExecution":
+        register = getattr(self.agent, "_register_action_items", None)
+        if callable(register):
+            raw_names = register(args[0] if args else None)
+        else:
+            agent_any = cast(Any, self.agent)
+            agent_any.use_actions(*args, always=True, **kwargs)
+            raw_names = getattr(self.agent, "_normalize_registered_action_ids", lambda value: [])(args[0] if args else None)
+        names = raw_names if isinstance(raw_names, (list, tuple, set)) else []
+        for name in names:
+            text = str(name or "").strip()
+            if text and text not in self.local_action_ids:
+                self.local_action_ids.append(text)
+        self._sync_action_scope(source="AgentExecution.use_actions")
+        self._selected_route = None
+        self.effective_options = self._build_effective_options()
+        return self
+
+    def require_actions(self, *args: Any, **kwargs: Any) -> "AgentExecution":
+        register = getattr(self.agent, "_register_action_items", None)
+        if callable(register):
+            raw_names = register(args[0] if args else None)
+        else:
+            agent_any = cast(Any, self.agent)
+            agent_any.require_actions(*args, always=True, **kwargs)
+            raw_names = getattr(self.agent, "_normalize_registered_action_ids", lambda value: [])(args[0] if args else None)
+        names = raw_names if isinstance(raw_names, (list, tuple, set)) else []
+        for name in names:
+            text = str(name or "").strip()
+            if text and text not in self.local_action_ids:
+                self.local_action_ids.append(text)
+            if text and text not in self.local_required_action_ids:
+                self.local_required_action_ids.append(text)
+        self._sync_action_scope(source="AgentExecution.require_actions")
+        self._selected_route = None
+        self.effective_options = self._build_effective_options()
+        return self
+
+    def _sync_action_scope(self, *, source: str):
+        self.execution_context.set_action_scope(self.local_action_ids, source=source)
+        self.diagnostics["action_scope"] = DataFormatter.sanitize(
+            dict(self.execution_context.action_scope)
+        )
+        return self
+
+    def use_skills(self, skills: Any, **kwargs: Any) -> "AgentExecution":
+        normalize = getattr(self.agent, "_normalize_skill_selector_entries", None)
+        if callable(normalize):
+            raw_entries = normalize(skills, **kwargs)
+        else:
+            raw_entries = [{"selector": skills, "mode": kwargs.get("mode", "model_decision")}]
+        entries = raw_entries if isinstance(raw_entries, list) else []
+        self.local_skill_selectors.extend(entries)
+        self._selected_route = None
+        self.effective_options = self._build_effective_options()
+        return self
+
+    def require_skills(self, skills: Any, **kwargs: Any) -> "AgentExecution":
+        kwargs["mode"] = "required"
+        return self.use_skills(skills, **kwargs)
+
+    def use_skills_packs(self, skills_packs: Any, *, mode: Any = "model_decision") -> "AgentExecution":
+        if mode not in {"model_decision", "required"}:
+            raise ValueError("Skill pack mode must be one of: 'model_decision', 'required'.")
+        items = skills_packs if isinstance(skills_packs, (list, tuple, set)) else [skills_packs]
+        self.local_skills_pack_selectors.extend(
+            {"selector": item, "mode": mode}
+            for item in items
+        )
+        self._selected_route = None
+        self.effective_options = self._build_effective_options()
+        return self
+
+    def route_policy(self, value: Any) -> "AgentExecution":
+        self.options["route_policy"] = DataFormatter.sanitize(value)
+        self.effective_options = self._build_effective_options()
+        self._selected_route = None
+        return self
+
+    def access_control_policy(self, value: Any) -> "AgentExecution":
+        self.options["access_control_policy"] = DataFormatter.sanitize(value)
+        self.effective_options = self._build_effective_options()
+        return self
+
+    def strategy(self, value: str | None = None, **options: Any) -> "AgentExecution":
+        if value is not None:
+            apply_strategy_selection(self, value, source="explicit_strategy")
+        if options:
+            if "execution" in options:
+                from agently.core.application import AgentTask
+
+                options = dict(options)
+                options["execution"] = AgentTask.normalize_execution_strategy(options.get("execution"))
+                options["_execution_strategy_source"] = "explicit_strategy_option"
+            self.task_options.update(options)
+        self.effective_options = self._build_effective_options()
+        self._selected_route = None
+        return self
 
     def route_options(self, route_name: str) -> dict[str, Any]:
-        routes = self.options.get("routes", {})
-        if not isinstance(routes, dict):
-            return {}
-        route_options = routes.get(route_name, {})
-        return dict(route_options) if isinstance(route_options, dict) else {}
+        return state_route_options(self, route_name)
 
-    def record_consumed_option(self, path: str, value: Any, *, owner: str):
-        self.consumed_options[path] = {
-            "value": DataFormatter.sanitize(value),
-            "owner": owner,
-        }
+    def record_consumed_option(self, path: str, value: Any, *, owner: str) -> None:
+        state_record_consumed_option(self, path, value, owner_name=owner)
 
     def task_target(self) -> str:
-        return self.route_planner.task_target()
+        return state_task_target(self)
+
+    def task_goal(self) -> str:
+        return state_task_goal(self)
+
+    def task_success_criteria(self) -> list[str]:
+        return state_task_success_criteria(self)
+
+    def required_action_ids(self) -> list[str]:
+        collect = getattr(self.agent, "_collect_required_action_ids", None)
+        required = [*self.local_required_action_ids]
+        if callable(collect):
+            collected = collect()
+            if isinstance(collected, (list, tuple, set)):
+                required.extend(collected)
+        constraints = self.options.get("capability_constraints")
+        if isinstance(constraints, dict):
+            actions = constraints.get("actions")
+            if isinstance(actions, dict):
+                configured = actions.get("required", [])
+            else:
+                configured = constraints.get("required_actions", [])
+            if isinstance(configured, str):
+                required = [*required, configured]
+            elif isinstance(configured, (list, tuple, set)):
+                required = [*required, *configured]
+        result: list[str] = []
+        for item in required:
+            text = str(item or "").strip()
+            if text and text not in result:
+                result.append(text)
+        return result
+
+    def required_skill_ids(self) -> list[str]:
+        required: list[Any] = []
+        for item in self.local_skill_selectors:
+            if item.get("mode") == "required":
+                selector = item.get("selector")
+                if isinstance(selector, dict):
+                    required.append(selector.get("id") or selector.get("skill_id") or selector.get("name") or selector.get("source"))
+                else:
+                    required.append(selector)
+        collect = getattr(self.agent, "_collect_skill_selectors", None)
+        try:
+            raw_required_selectors = collect(skills=None, mode="required") if callable(collect) else []
+        except Exception:
+            raw_required_selectors = []
+        required_selectors = raw_required_selectors if isinstance(raw_required_selectors, (list, tuple, set)) else []
+        for item in required_selectors:
+            selector = item.get("selector") if isinstance(item, dict) else item
+            if isinstance(selector, dict):
+                required.append(selector.get("id") or selector.get("skill_id") or selector.get("name") or selector.get("source"))
+            else:
+                required.append(selector)
+        constraints = self.options.get("capability_constraints")
+        if isinstance(constraints, dict):
+            skills = constraints.get("skills")
+            if isinstance(skills, dict):
+                configured = skills.get("required", [])
+            else:
+                configured = constraints.get("required_skills", [])
+            if isinstance(configured, str):
+                required.append(configured)
+            elif isinstance(configured, (list, tuple, set)):
+                required.extend(configured)
+        result: list[str] = []
+        for item in required:
+            text = str(item or "").strip()
+            if text and text not in result:
+                result.append(text)
+        return result
+
+    def is_task_strategy(self) -> bool:
+        return state_is_task_strategy(self)
+
+    def task_strategy_options(self) -> dict[str, Any]:
+        options = dict(self.task_options)
+        if "execution" not in options:
+            inherited = self.inherited_effective_task_execution_strategy or self.inherited_task_execution_strategy
+            if inherited in {"flat", "taskboard"}:
+                options["execution"] = inherited
+                options["_execution_strategy_source"] = "inherited_agent_execution_context"
+        return options
 
     async def emit_stream(
         self,
@@ -156,22 +809,24 @@ class AgentExecution:
         task_id: str | None = None,
         action_id: str | None = None,
         graph_id: str | None = None,
-        is_complete: bool = True,
+        is_complete: bool | None = None,
         event_type: Literal["delta", "done"] = "done",
         delta: str | None = None,
         meta: dict[str, Any] | None = None,
     ) -> AgentExecutionStreamData:
+        completed = event_type == "done"
+        if is_complete is not None:
+            completed = is_complete
         if path != "error":
             self.execution_context.record_progress(
                 stage=path,
-                status="completed" if is_complete else "progress",
+                status="completed" if completed else "progress",
                 event_type=path,
                 meta=meta,
             )
         stream_meta = merge_stream_meta(
             meta,
             execution_id=self.id,
-            mode=self.mode,
             lineage=self.lineage,
         )
         return await self.stream.emit(
@@ -184,16 +839,13 @@ class AgentExecution:
             task_id=task_id,
             action_id=action_id,
             graph_id=graph_id,
-            is_complete=is_complete,
+            is_complete=completed,
             event_type=event_type,
             meta=stream_meta,
         )
 
-    async def close_streams(self):
+    async def close_streams(self) -> None:
         await self.stream.close()
-
-    def dynamic_task_candidates(self) -> list[dict[str, Any]]:
-        return self.route_planner.dynamic_task_candidates()
 
     def action_candidates(self) -> list[dict[str, Any]]:
         return self.route_planner.action_candidates()
@@ -204,7 +856,25 @@ class AgentExecution:
     async def select_route(self) -> tuple[str, dict[str, Any]]:
         if self._selected_route is not None:
             return self._selected_route
-        route, route_meta = await self.route_planner.select_route()
+        self._refresh_prompt_snapshot()
+        if self.is_task_strategy():
+            strategy = self.strategy_name or "task"
+            route, route_meta = "agent_task", {
+                "strategy": strategy,
+                "selected_by": "execution_strategy",
+                "goals": list(self.goal_items),
+                "success_criteria": list(self.success_criteria_items),
+                "generated_success_criteria": list(self.generated_success_criteria),
+            }
+        elif self.required_action_ids() and self.route_planner.route_allowed("model_request"):
+            route, route_meta = "model_request", {
+                "with_actions": True,
+                "required_actions": self.required_action_ids(),
+                "required_skills": self.required_skill_ids(),
+                "selected_by": "required_capability",
+            }
+        else:
+            route, route_meta = await self.route_planner.select_route()
         self._selected_route = (route, route_meta)
         self.route_info = {
             "selected_route": route,
@@ -225,43 +895,19 @@ class AgentExecution:
         max_retries: int,
         raise_ensure_failure: bool,
     ) -> tuple[str, Any]:
-        with bind_runtime_context(agent_execution_context=self.execution_context):
-            self.execution_context.record_progress(stage="route_selection", status="started")
-            route, route_meta = await self.select_route()
-            self.execution_context.record_progress(stage="route_selection", status="completed")
-            self.route_plan = self.route_planner.build_route_plan(
-                execution_id=self.id,
-                route=route,
-                route_meta=route_meta,
-            )
-            self.route_info.setdefault("selected_route", route)
-            self.route_info.setdefault("options", DataFormatter.sanitize(route_meta))
-            self.route_info.setdefault("reusable", True)
-            await self.emit_stream("route.selected", self.route_plan, route=route)
-            if route == "skills":
-                result = await run_skills_route(self, route_meta)
-            elif route == "dynamic_task":
-                result = await run_dynamic_task_route(self, route_meta)
-            else:
-                result = await run_model_request_route(
-                    self,
-                    type=type,
-                    ensure_keys=ensure_keys,
-                    ensure_all_keys=ensure_all_keys,
-                    validate_handler=validate_handler,
-                    key_style=key_style,
-                    max_retries=max_retries,
-                    raise_ensure_failure=raise_ensure_failure,
-                )
-            return route, result
+        return await async_execute_route(
+            self,
+            type=type,
+            ensure_keys=ensure_keys,
+            ensure_all_keys=ensure_all_keys,
+            validate_handler=validate_handler,
+            key_style=key_style,
+            max_retries=max_retries,
+            raise_ensure_failure=raise_ensure_failure,
+        )
 
-    def record_model_response_id(self, response_id: str | None):
-        if not response_id:
-            return
-        ids = self.logs.setdefault("model_response_ids", [])
-        if isinstance(ids, list) and response_id not in ids:
-            ids.append(response_id)
-        self.logs.setdefault("model_response_id", response_id)
+    def record_model_response_id(self, response_id: str | None) -> None:
+        record_model_response_id_entry(self, response_id)
 
     async def record_action_log(
         self,
@@ -271,57 +917,10 @@ class AgentExecution:
         source: str = "action",
         emit: bool = True,
     ) -> dict[str, Any] | None:
-        if not isinstance(log, dict):
-            return None
-        raw_model_digest = log.get("model_digest")
-        model_digest: dict[str, Any] = raw_model_digest if isinstance(raw_model_digest, dict) else {}
-        action_id = str(log.get("action_id") or log.get("tool_name") or model_digest.get("action_id") or "action")
-        action_call_id = log.get("action_call_id") or model_digest.get("action_call_id")
-        status = str(log.get("status") or model_digest.get("status") or "")
-        artifact_refs = log.get("artifact_refs") or model_digest.get("artifact_refs") or []
-        if not isinstance(artifact_refs, list):
-            artifact_refs = []
-        key = str(action_call_id or f"{ action_id }:{ len(self.logs.get('action_logs', [])) }")
-        if key in self._seen_action_log_keys:
-            return None
-        self._seen_action_log_keys.add(key)
-        data = log.get("data")
-        if data is None:
-            data = log.get("result")
-        normalized = DataFormatter.sanitize(
-            {
-                "action_call_id": action_call_id,
-                "action_id": action_id,
-                "status": status,
-                "success": log.get("success") if "success" in log else model_digest.get("success"),
-                "source": source,
-                "route": route,
-                "data": data if isinstance(data, dict) else {},
-                "model_digest": model_digest,
-                "artifact_refs": artifact_refs,
-                "raw": log,
-            }
-        )
-        action_logs = self.logs.setdefault("action_logs", [])
-        if isinstance(action_logs, list):
-            action_logs.append(normalized)
-        aggregated_artifact_refs = self.logs.setdefault("artifact_refs", [])
-        if isinstance(aggregated_artifact_refs, list):
-            for ref in artifact_refs:
-                if ref not in aggregated_artifact_refs:
-                    aggregated_artifact_refs.append(DataFormatter.sanitize(ref))
-        if emit:
-            await self.emit_stream(
-                f"actions.{ action_id }",
-                normalized,
-                route=route,
-                source=source,
-                action_id=action_id,
-            )
-        return normalized
+        return await record_action_log_entry(self, log, route=route, source=source, emit=emit)
 
-    async def bridge_task_dag_stream_item(self, item: Any, *, route: str):
-        await self.stream.bridge_task_dag_item(item, route=route)
+    async def bridge_task_dag_stream_item(self, item: Any, *, route: str) -> None:
+        await bridge_task_dag_stream_item_entry(self, item, route=route)
 
     async def bridge_model_stream_item(
         self,
@@ -335,8 +934,9 @@ class AgentExecution:
         action_id: str | None = None,
         graph_id: str | None = None,
         meta: dict[str, Any] | None = None,
-    ):
-        await self.stream.bridge_model_stream_item(
+    ) -> None:
+        await bridge_model_stream_item_entry(
+            self,
             item,
             route=route,
             source=source,
@@ -358,164 +958,25 @@ class AgentExecution:
         key_style: Literal["dot", "slash"] = "dot",
         max_retries: int = 3,
         raise_ensure_failure: bool = True,
+        parent_run_context: "RunContext | None" = None,
     ) -> Any:
-        async with self._start_lock:
-            if self._completed:
-                if self._error is not None:
-                    raise self._error
-                return self.result
-            if self._started:
-                while not self._completed:
-                    await asyncio.sleep(0.01)
-                if self._error is not None:
-                    raise self._error
-                return self.result
-            self._started = True
-            self.status = "running"
-            try:
-                self.execution_context.record_progress(
-                    stage="agent_execution",
-                    status="started",
-                    event_type="agent_execution.started",
-                    meta={"execution_id": self.id, "execution_mode": self.mode},
-                )
-                run_coro = self._async_execute_route(
-                    type=type,
-                    ensure_keys=ensure_keys,
-                    ensure_all_keys=ensure_all_keys,
-                    validate_handler=validate_handler,
-                    key_style=key_style,
-                    max_retries=max_retries,
-                    raise_ensure_failure=raise_ensure_failure,
-                )
-                route, self.result = await self._await_route_with_limits(run_coro)
-                if self.status == "running":
-                    self.status = "success"
-                await self.emit_stream("result", self.result, route=route, source="agent_execution")
-                return self.result
-            except RuntimeStageStallError as error:
-                self.status = "timed_out" if error.status == "timed_out" else "stalled"
-                self._error = error
-                self._record_error_diagnostic(error)
-                await self.emit_stream(
-                    "error",
-                    error.to_diagnostic(),
-                    source="agent_execution",
-                )
-                raise
-            except asyncio.TimeoutError as error:
-                self.status = "timed_out"
-                timeout_error = RuntimeStageStallError(
-                    (
-                        "AgentExecution hard deadline exceeded: "
-                        f"max_seconds={ self.limits.get('max_seconds') }."
-                    ),
-                    stage=str((self.execution_context.last_progress_event or {}).get("stage") or "agent_execution"),
-                    status="timed_out",
-                    elapsed_seconds=None,
-                    timeout_seconds=self.limits.get("max_seconds"),
-                    last_progress_event=(self.execution_context.last_progress_event or {}).get("event_type"),
-                )
-                self._error = timeout_error
-                self._record_error_diagnostic(timeout_error)
-                await self.emit_stream(
-                    "error",
-                    timeout_error.to_diagnostic(),
-                    source="agent_execution",
-                )
-                raise timeout_error from error
-            except AgentExecutionLimitExceeded as error:
-                self.status = "blocked"
-                self._error = error
-                self._record_error_diagnostic(error)
-                await self.emit_stream(
-                    "error",
-                    {"type": error.__class__.__name__, "message": str(error), "limit_name": error.limit_name},
-                    source="agent_execution",
-                )
-                raise
-            except BaseException as error:
-                self.status = "error"
-                self._error = error
-                self._record_error_diagnostic(error)
-                await self.emit_stream(
-                    "error",
-                    {"type": error.__class__.__name__, "message": str(error)},
-                    source="agent_execution",
-                )
-                raise
-            finally:
-                self._refresh_diagnostics()
-                self._completed = True
-                await self.close_streams()
+        return await start_execution(
+            self,
+            type=type,
+            ensure_keys=ensure_keys,
+            ensure_all_keys=ensure_all_keys,
+            validate_handler=validate_handler,
+            key_style=key_style,
+            max_retries=max_retries,
+            raise_ensure_failure=raise_ensure_failure,
+            parent_run_context=parent_run_context,
+        )
 
     async def _await_route_with_limits(self, run_coro: Any):
-        max_seconds = self.limits.get("max_seconds")
-        max_no_progress_seconds = self.limits.get("max_no_progress_seconds")
-        if max_seconds is None and max_no_progress_seconds is None:
-            return await run_coro
-
-        hard_deadline = (
-            self.execution_context.started_at + float(max_seconds)
-            if max_seconds is not None
-            else None
-        )
-        idle_limit = float(max_no_progress_seconds) if max_no_progress_seconds is not None else None
-        task = asyncio.create_task(run_coro)
-        try:
-            while True:
-                now = time.monotonic()
-                next_timeouts: list[float] = []
-                if hard_deadline is not None:
-                    next_timeouts.append(max(0.0, hard_deadline - now))
-                if idle_limit is not None:
-                    idle_deadline = self.execution_context.last_progress_at + idle_limit
-                    next_timeouts.append(max(0.0, idle_deadline - now))
-                if not next_timeouts:
-                    return await task
-
-                try:
-                    return await asyncio.wait_for(asyncio.shield(task), timeout=min(next_timeouts))
-                except asyncio.TimeoutError as error:
-                    if task.done():
-                        return await task
-                    now = time.monotonic()
-                    if hard_deadline is not None and now >= hard_deadline:
-                        await self._cancel_limited_task(task)
-                        raise self._build_execution_stall_error(
-                            status="timed_out",
-                            message=(
-                                "AgentExecution hard deadline exceeded: "
-                                f"max_seconds={ max_seconds }."
-                            ),
-                            elapsed_seconds=now - self.execution_context.started_at,
-                            idle_seconds=now - self.execution_context.last_progress_at,
-                            timeout_seconds=float(max_seconds) if max_seconds is not None else None,
-                        ) from error
-                    if idle_limit is not None:
-                        idle_seconds = now - self.execution_context.last_progress_at
-                        if idle_seconds >= idle_limit:
-                            await self._cancel_limited_task(task)
-                            raise self._build_execution_stall_error(
-                                status="stalled",
-                                message=(
-                                    "AgentExecution made no progress before idle deadline: "
-                                    f"max_no_progress_seconds={ max_no_progress_seconds }."
-                                ),
-                                elapsed_seconds=now - self.execution_context.started_at,
-                                idle_seconds=idle_seconds,
-                                timeout_seconds=idle_limit,
-                            ) from error
-        except BaseException:
-            if not task.done():
-                task.cancel()
-            raise
+        return await await_route_with_limits(self, run_coro)
 
     async def _cancel_limited_task(self, task: "asyncio.Task[Any]"):
-        if task.done():
-            return
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await cancel_limited_task(task)
 
     def _build_execution_stall_error(
         self,
@@ -526,19 +987,13 @@ class AgentExecution:
         idle_seconds: float | None,
         timeout_seconds: float | None,
     ) -> RuntimeStageStallError:
-        last_event = self.execution_context.last_progress_event or {}
-        return RuntimeStageStallError(
-            message,
-            stage=str(last_event.get("stage") or "agent_execution"),
+        return build_execution_stall_error(
+            self,
             status=status,
+            message=message,
             elapsed_seconds=elapsed_seconds,
             idle_seconds=idle_seconds,
             timeout_seconds=timeout_seconds,
-            last_progress_event=(
-                str(last_event.get("event_type"))
-                if last_event.get("event_type") is not None
-                else None
-            ),
         )
 
     async def async_get_data(
@@ -551,8 +1006,10 @@ class AgentExecution:
         key_style: Literal["dot", "slash"] = "dot",
         max_retries: int = 3,
         raise_ensure_failure: bool = True,
+        parent_run_context: "RunContext | None" = None,
     ) -> Any:
-        return await self.async_start(
+        return await async_get_data_entry(
+            self,
             type=type,
             ensure_keys=ensure_keys,
             ensure_all_keys=ensure_all_keys,
@@ -560,34 +1017,19 @@ class AgentExecution:
             key_style=key_style,
             max_retries=max_retries,
             raise_ensure_failure=raise_ensure_failure,
+            parent_run_context=parent_run_context,
         )
 
-    async def async_get_text(self) -> str:
-        data = await self.async_get_data()
-        if isinstance(data, str):
-            return data
-        return json.dumps(DataFormatter.sanitize(data), ensure_ascii=False)
+    async def async_get_text(
+        self,
+        *,
+        parent_run_context: "RunContext | None" = None,
+        **kwargs: Any,
+    ) -> str:
+        return await async_get_text_entry(self, parent_run_context=parent_run_context, **kwargs)
 
     async def async_get_meta(self) -> dict[str, Any]:
-        if not self._completed:
-            await self.async_start()
-        self._refresh_diagnostics()
-        return {
-            "execution_id": self.id,
-            "execution_mode": self.mode,
-            "status": self.status,
-            "lineage": DataFormatter.sanitize(self.lineage),
-            "limits": DataFormatter.sanitize(self.limits),
-            "options": DataFormatter.sanitize(self.options),
-            "effective_options": DataFormatter.sanitize(self.effective_options),
-            "consumed_options": DataFormatter.sanitize(self.consumed_options),
-            "route_plan": DataFormatter.sanitize(self.route_plan),
-            "route": DataFormatter.sanitize(self.route_info),
-            "close_snapshot": DataFormatter.sanitize(self.close_snapshot),
-            "logs": DataFormatter.sanitize(self.logs),
-            "diagnostics": DataFormatter.sanitize(self.diagnostics),
-            "workspace_refs": DataFormatter.sanitize(self.workspace_refs),
-        }
+        return await async_get_meta_entry(self)
 
     async def async_record_workspace(
         self,
@@ -604,173 +1046,56 @@ class AgentExecution:
         checkpoint_step_id: str | None = None,
         profile: str = "fast",
     ) -> dict[str, Any]:
-        if self.workspace is None:
-            raise RuntimeError(
-                "AgentExecution has no Workspace binding. "
-                "Call agent.use_workspace(...) before create_execution(...)."
-            )
-        if not self._completed:
-            await self.async_get_data()
-        self._refresh_diagnostics()
-
-        record_scope = self._workspace_scope(scope)
-        record_source = self._workspace_source(source)
-        record_meta = {
-            "execution_id": self.id,
-            "execution_mode": self.mode,
-            "lineage": DataFormatter.sanitize(self.lineage),
-        }
-        record_meta.update(dict(meta or {}))
-        record_content = content if content is not None else self._default_workspace_content()
-        record_summary = summary or self._default_workspace_summary(collection)
-
-        record_ref = await self.workspace.ingest(
-            content=record_content,
+        return await record_workspace_entry(
+            self,
             collection=collection,
             kind=kind,
-            scope=record_scope,
-            source=record_source,
-            summary=record_summary,
-            meta=record_meta,
+            content=content,
+            summary=summary,
+            scope=scope,
+            source=source,
+            meta=meta,
+            checkpoint=checkpoint,
+            checkpoint_state=checkpoint_state,
+            checkpoint_step_id=checkpoint_step_id,
             profile=profile,
-        )
-        self._append_workspace_ref(collection, record_ref)
-
-        checkpoint_ref = None
-        if checkpoint:
-            checkpoint_run_id = str(record_scope.get("task_id") or self.lineage.get("task_id") or self.id)
-            checkpoint_ref = await self.workspace.checkpoint(
-                checkpoint_run_id,
-                checkpoint_state or self._default_checkpoint_state(record_ref),
-                step_id=checkpoint_step_id or self.lineage.get("step_id"),
-            )
-            self._append_workspace_ref("checkpoints", checkpoint_ref)
-
-        return DataFormatter.sanitize(
-            {
-                "record": record_ref,
-                "checkpoint": checkpoint_ref,
-                "workspace_refs": self.workspace_refs,
-            }
         )
 
     async def get_async_generator(
         self,
-        type: Literal["instant", "streaming_parse", "all"] | str | None = "instant",
+        type: Literal["delta", "instant", "streaming_parse", "all"] | str | None = "delta",
         content: Any = None,
         **_: Any,
     ) -> AsyncGenerator[Any, None]:
-        if content is not None and type is None:
-            type = content
-        if self._completed:
-            for item in self.stream.items:
-                yield ("agent_execution", item) if type == "all" else item
-            return
-        queue: asyncio.Queue[Any] = asyncio.Queue()
-        for item in self.stream.items:
-            await queue.put(item)
-        self.stream.queues.append(queue)
-        start_task = asyncio.create_task(self.async_start())
-        try:
-            while True:
-                item = await queue.get()
-                if item is None:
-                    break
-                yield ("agent_execution", item) if type == "all" else item
-            await start_task
-        finally:
-            if queue in self.stream.queues:
-                self.stream.queues.remove(queue)
+        async for item in get_async_generator_entry(self, type=type, content=content, **_):
+            yield item
 
     def _get_generator(self, *args: Any, **kwargs: Any) -> Generator[Any, None, None]:
-        return FunctionShifter.syncify_async_generator(self.get_async_generator(*args, **kwargs))
+        return sync_generator_entry(self, *args, **kwargs)
 
-    def _refresh_diagnostics(self):
-        context_diagnostics = self.execution_context.diagnostics()
-        budget = context_diagnostics.get("budget", {})
-        limit_events = context_diagnostics.get("limit_events", [])
-        self.diagnostics["budget"] = budget
-        if limit_events:
-            self.diagnostics["limit_events"] = limit_events
-        for key in ("stages", "last_progress"):
-            value = context_diagnostics.get(key)
-            if value:
-                self.diagnostics[key] = value
+    def _refresh_diagnostics(self) -> None:
+        refresh_diagnostics(self)
 
-    def _record_error_diagnostic(self, error: BaseException):
-        errors = self.diagnostics.setdefault("errors", [])
-        if isinstance(errors, list):
-            item = (
-                error.to_diagnostic()
-                if isinstance(error, (AgentExecutionLimitExceeded, RuntimeStageStallError))
-                else {"type": error.__class__.__name__, "message": str(error)}
-            )
-            errors.append(item)
-            if isinstance(error, RuntimeStageStallError):
-                target_key = "timeouts" if error.status == "timed_out" else "stalls"
-                target = self.diagnostics.setdefault(target_key, [])
-                if isinstance(target, list):
-                    target.append(item)
+    def _record_error_diagnostic(self, error: BaseException) -> None:
+        record_error_diagnostic(self, error)
 
-    def raise_if_limit_exceeded(self):
+    def raise_if_limit_exceeded(self) -> None:
         self.execution_context.raise_if_limit_exceeded()
 
     def _workspace_scope(self, scope: dict[str, Any] | None = None) -> dict[str, Any]:
-        lineage_scope = self.lineage.get("scope")
-        merged = dict(lineage_scope) if isinstance(lineage_scope, dict) else {}
-        for key in ("task_id", "iteration_id", "step_id"):
-            value = self.lineage.get(key)
-            if value is not None:
-                merged.setdefault(key, value)
-        merged.update(dict(scope or {}))
-        return DataFormatter.sanitize(merged)
+        return workspace_scope(self, scope)
 
     def _workspace_source(self, source: dict[str, Any] | None = None) -> dict[str, Any]:
-        default_source = {
-            "type": "agent_execution",
-            "execution_id": self.id,
-            "execution_mode": self.mode,
-            "task_id": self.lineage.get("task_id"),
-            "iteration_id": self.lineage.get("iteration_id"),
-            "step_id": self.lineage.get("step_id"),
-        }
-        default_source.update(dict(source or {}))
-        return DataFormatter.sanitize(default_source)
+        return workspace_source(self, source)
 
     def _default_workspace_content(self) -> dict[str, Any]:
-        return DataFormatter.sanitize(
-            {
-                "execution_id": self.id,
-                "execution_mode": self.mode,
-                "status": self.status,
-                "lineage": self.lineage,
-                "result": self.result,
-                "route_plan": self.route_plan,
-                "diagnostics": self.diagnostics,
-            }
-        )
+        return default_workspace_content(self)
 
     def _default_workspace_summary(self, collection: str) -> str:
-        task_id = self.lineage.get("task_id") or self.id
-        step_id = self.lineage.get("step_id") or self.mode
-        return f"{ task_id } { step_id } AgentExecution { collection }"
+        return default_workspace_summary(self, collection)
 
     def _default_checkpoint_state(self, record_ref: dict[str, Any]) -> dict[str, Any]:
-        return DataFormatter.sanitize(
-            {
-                "execution_id": self.id,
-                "execution_mode": self.mode,
-                "status": self.status,
-                "lineage": self.lineage,
-                "record_ref": record_ref,
-                "diagnostics": self.diagnostics,
-            }
-        )
+        return default_checkpoint_state(self, record_ref)
 
     def _append_workspace_ref(self, key: str, ref: dict[str, Any]):
-        ref_id = ref.get("id")
-        if not ref_id:
-            return
-        refs = self.workspace_refs.setdefault(key, [])
-        if isinstance(refs, list) and ref_id not in refs:
-            refs.append(ref_id)
+        append_workspace_ref(self, key, ref)

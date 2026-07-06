@@ -33,10 +33,10 @@ Agently 是一个面向 AI 应用开发的框架，服务于团队从模型原�
    - [Context Engineering](requests/context-engineering.md)
    - [Workspace](requests/workspace.md)
 
-3. **Action** — 可被模型调用的动作、内置能力包、MCP、托管执行环境与兼容入口
+3. **Action** — 可被模型调用的动作、内置能力包、MCP、托管执行资源与兼容入口
    - [Actions 概览](actions/overview.md)
    - [Action Runtime](actions/action-runtime.md)
-   - [Execution Environment](actions/execution-environment.md)
+   - [ExecutionResource](actions/execution-environment.md)
    - [工具兼容](actions/tools.md)
    - [MCP](actions/mcp.md)
 
@@ -49,6 +49,10 @@ Agently 是一个面向 AI 应用开发的框架，服务于团队从模型原�
    - [Event Center](observability/event-center.md)
    - [DevTools](observability/devtools.md)
    - [Coding Agents](development/coding-agents.md)
+   - [Agently 4.1.3.9 Release Notes](development/release-notes-4.1.3.9.md)
+   - [Agently 4.1.3.8 Release Notes](development/release-notes-4.1.3.8.md)
+   - [Agently 4.1.3.7 Release Notes](development/release-notes-4.1.3.7.md)
+   - [Agently 4.1.3.6 Release Notes](development/release-notes-4.1.3.6.md)
    - [Agently 4.1.3.5 Release Notes](development/release-notes-4.1.3.5.md)
    - [Agently 4.1.3.4 Release Notes](development/release-notes-4.1.3.4.md)
    - [Agently 4.1.3.3 Release Notes](development/release-notes-4.1.3.3.md)
@@ -80,6 +84,7 @@ Agently 是一个面向 AI 应用开发的框架，服务于团队从模型原�
 9. **架构与参考**
    - [扩展边界](architecture/extension-boundaries.md)
    - [能力地图](reference/capability-map.md)
+   - [执行层选择](reference/execution-layer-selection.md)
    - [术语表](reference/glossary.md)
 
 ## 社区

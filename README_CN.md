@@ -1,6 +1,6 @@
 <img width="640" alt="Agently" src="https://github.com/user-attachments/assets/c645d031-c8b0-4dba-a515-9d7a4b0a6881" />
 
-# Agently 4.1.3.5 - AI 应用运行时框架
+# Agently 4.1.3.9 - AI 应用运行时框架
 
 > 构建具备结构化输出、可观测 Actions、运行时 Skills、MCP 能力、过程流和可恢复工作流的 AI 服务后端。
 
@@ -32,9 +32,16 @@ Agently 面向的是正在从“模型偶尔能做对”走向“应用必须稳
 
 核心设计问题是：怎样保留模型能力，同时让应用代码拥有稳定契约、可观测执行和可重启的工作流边界？
 
-Agently 4.1.3.5 让请求和输出控制默认值更稳：结构化输出默认值由 settings 持有，
-必填字段必须解析为有意义的值，Agent quick prompt 链隔离 turn-local prompt draft，
-并用 `set_turn_prompt(...)` 命名单 turn prompt 写入表面。完整版本叙事见
+Agently 4.1.3.9 将 Workspace retrieval 和 Session memory 推进为共享框架底座：
+`workspace.retrieve(...)` 通过 keyword/tag 候选、可选 vector/hybrid retrieval、
+结构 gate 控制的 rerank、refill 和紧凑模型热投影打包 record/file evidence；
+`SessionMemory` 与 `AgentlyMemory` 把持久 `GLOBAL_MEMORY` 和 `SESSION_MEMORY`
+写入 Workspace；AgentTask scoped retrieval 复用同一召回底座；公开 typing 也覆盖了
+新的 Workspace vector seam 和 TaskBoard 常见 dict payload 更新路径。完整版本叙事见
+[4.1.3.9 Release Notes](docs/cn/development/release-notes-4.1.3.9.md)、
+[4.1.3.8 Release Notes](docs/cn/development/release-notes-4.1.3.8.md)、
+[4.1.3.7 Release Notes](docs/cn/development/release-notes-4.1.3.7.md)、
+[4.1.3.6 Release Notes](docs/cn/development/release-notes-4.1.3.6.md)、
 [4.1.3.5 Release Notes](docs/cn/development/release-notes-4.1.3.5.md)、
 [4.1.3.4 Release Notes](docs/cn/development/release-notes-4.1.3.4.md)、
 [4.1.3.3 Release Notes](docs/cn/development/release-notes-4.1.3.3.md)、
@@ -48,19 +55,19 @@ Agently 4.1.3.5 让请求和输出控制默认值更稳：结构化输出默认�
 
 当你关心这些问题时，Agently 会比较合适：
 
-- **AI 服务应该是运行时执行，不是 prompt glue** - 一次 Agent turn 可以声明候选 Actions、Skills、MCP 服务、Dynamic Task 规划、过程流和输出契约，并通过同一套运行时表面执行。阅读 [4.1.3 Release Notes](docs/cn/development/release-notes-4.1.3.md)、[Agent Auto Orchestration 示例](examples/agent_auto_orchestration/) 和 [Skills Executor 示例](examples/skills_executor/)。
+- **AI 服务应该是运行时执行，不是 prompt glue** - 一次 Agent execution 可以声明候选 Actions、Skills、MCP 服务、Dynamic Task 规划、过程流、Workspace-backed retrieval 和输出契约，并通过同一套运行时表面执行。阅读 [4.1.3.9 Release Notes](docs/cn/development/release-notes-4.1.3.9.md)、[Agent Auto Orchestration 示例](examples/agent_auto_orchestration/) 和 [Skills Executor 示例](examples/skills_executor/)。
 - **换模型不应重写业务逻辑** - Agently 把 provider setup、Prompt 槽位、响应解析、Action 执行和响应读取归一到同一套 request/runtime contract。阅读 [模型设置](docs/cn/start/model-setup.md)、[模型概览](docs/cn/models/overview.md) 和 [Requests 概览](docs/cn/requests/overview.md)。
 - **结构化输出应是框架保障，不只是 provider 能力** - `.output(...)` schema、必填字段提取、parser feedback、重试、`ensure_keys`、`ensure_all_keys` 和 validation handlers 在 Agently 内部协同工作。阅读 [Schema as Prompt](docs/cn/requests/schema-as-prompt.md)、[输出控制](docs/cn/requests/output-control.md) 和 [`examples/basic/`](examples/basic/)。
 - **流式输出应在最后一个 token 前暴露结构** - `instant` mode 允许消费者在模型仍在流式输出时响应结构化字段，适合 UI 更新、SSE routes 和 workflow signals。阅读 [模型响应](docs/cn/requests/model-response.md)、[FastAPI 服务封装](docs/cn/services/fastapi.md) 和 [`examples/fastapi/`](examples/fastapi/)。
 - **Actions 应该可观测且可跨模型迁移** - 本地函数、内置 actions、MCP servers、Shell/Python/Node/SQLite/workspace helpers 和自定义 executors 都会产生结构化记录，并共享同一套 Action Runtime。阅读 [Action Runtime](docs/cn/actions/action-runtime.md)、[MCP](docs/cn/actions/mcp.md) 和 [`examples/action_runtime/`](examples/action_runtime/)。
 - **Skills 应该是运行时能力，不是内联 prompt 片段** - `agent.use_skills(...)` 可以声明本地或远程 Skill sources；Skills Executor 负责发现、安装、选择、挂接 MCP/script 能力、输出诊断，并且只在 planner 命中时执行。阅读 [Skills Executor](docs/cn/development/skills-executor.md) 和 [`examples/skills_executor/`](examples/skills_executor/)。
-- **执行依赖应该有生命周期所有者** - Execution Environment providers 管理 MCP 进程、浏览器会话、Shell/Python/Node runtimes、SQLite handles 和沙箱等可复用资源。阅读 [Execution Environment](docs/cn/actions/execution-environment.md) 和 [`examples/execution_environment/`](examples/execution_environment/)。
+- **执行依赖应该有生命周期所有者** - Execution Resource providers 管理 MCP 进程、浏览器会话、Shell/Python/Node runtimes、SQLite handles 和沙箱等可复用资源。阅读 [Execution Resource](docs/cn/actions/execution-environment.md) 和 [`examples/execution_resource/`](examples/execution_resource/)。
 - **生成式计划应落成可校验任务图** - Dynamic Task 通过 `Agently.create_dynamic_task(...)` 把模型生成或应用提交的 DAG 数据变成可校验、可观测的任务执行。阅读 [Dynamic Task](docs/cn/dynamic-task/README.md) 和 [`examples/dynamic_task/`](examples/dynamic_task/)。
 - **工作流应是信号驱动，而不只是图结构** - TriggerFlow 支持 events、fan-out、runtime streams、pause/resume、save/load、sub-flows 和 close snapshots；`instant` 结构化输出可以不等完整响应结束就成为工作流输入。阅读 [TriggerFlow 概览](docs/cn/triggerflow/overview.md)、[事件与流](docs/cn/triggerflow/events-and-streams.md) 和 [`examples/trigger_flow/`](examples/trigger_flow/)。
 - **常见模型应用模式应该可组合** - router、To-Do/dependency execution、planning、reflection、evaluator/reviser 和多 Agent 协作，都可以由同一套 request/action/signal primitives 组合出来。阅读 [Playbooks](docs/cn/playbooks/overview.md)、[TriggerFlow 模型集成](docs/cn/triggerflow/model-integration.md) 和 [`examples/step_by_step/`](examples/step_by_step/)。
 - **服务应保持清晰项目边界** - async API、FastAPI helpers、settings 文件、prompt 文件、DevTools 观测和 companion coding-agent skills 适合非一次性项目。阅读 [项目结构](docs/cn/start/project-framework.md)、[FastAPI 服务封装](docs/cn/services/fastapi.md) 和 [观测概览](docs/cn/observability/overview.md)。
 
-当前框架版本：`4.1.3.5`。
+当前框架版本：`4.1.3.9`。
 
 Python：`>=3.10`。
 
@@ -80,7 +87,7 @@ Python：`>=3.10`。
 
 实际差异主要体现在四层：
 
-- **相对 LangChain 的 integration-first 风格：** LangChain 适合需要广泛、灵活地组合模型、工具、检索和 agent 构建块的场景。Agently 的判断是：生产级模型应用需要更统一的 request contract，不同模型 provider 仍应进入同一套 Prompt 槽位、结构化 parser、retry/validation 路径、`ModelResponse` 读取方式和 Action Runtime。这样在替换基础模型或 provider 时，下游业务逻辑更不容易被输出形态或工具调用形态冲击。可从 [Requests 概览](docs/cn/requests/overview.md) 和 [Action Runtime](docs/cn/actions/action-runtime.md) 开始。
+- **相对 LangChain 的 integration-first 风格：** LangChain 适合需要广泛、灵活地组合模型、工具、检索和 agent 构建块的场景。Agently 的判断是：生产级模型应用需要更统一的 request contract，不同模型 provider 仍应进入同一套 Prompt 槽位、结构化 parser、retry/validation 路径、可复用 result 读取方式和 Action Runtime。这样在替换基础模型或 provider 时，下游业务逻辑更不容易被输出形态或工具调用形态冲击。可从 [Requests 概览](docs/cn/requests/overview.md) 和 [Action Runtime](docs/cn/actions/action-runtime.md) 开始。
 - **相对只依赖 provider-native structured output：** Agently 可以使用模型 provider，但输出质量保障不只依赖 provider 侧 JSON schema 或 tool-calling 参数。框架内建 schema-as-prompt authoring、必填字段提取、parser feedback、重试、`ensure_keys`、`ensure_all_keys` 和 validation handlers。当目标模型没有和另一个 provider 完全一致的 structured-output 或 tool-calling 语义时，这一点尤其重要。见 [Schema as Prompt](docs/cn/requests/schema-as-prompt.md) 和 [输出控制](docs/cn/requests/output-control.md)。
 - **相对 graph-only orchestration：** LangGraph 很适合图式 stateful agents 和 durable execution。TriggerFlow 的核心是事件/信号驱动，Agently 的 `instant` response mode 可以在模型仍在流式输出时暴露结构化字段，因此 workflow signals 可以由局部结构化输出、Action 结果、人工输入或 sub-flow state 驱动，而不必等完整模型响应结束。见 [模型响应](docs/cn/requests/model-response.md)、[TriggerFlow 事件与流](docs/cn/triggerflow/events-and-streams.md) 和 [`examples/fastapi/`](examples/fastapi/) 中的流式/服务化模式。
 - **相对把多 Agent 当作框架根抽象：** 多 Agent 协作很有用，但在 Agently 里它是建立在 requests、Actions、TriggerFlow signals、sub-flows、Session 和 runtime resources 之上的可开发场景。Router、To-Do/dependency execution、planning、reflection、evaluator/reviser 和 agent-team patterns 都是同一套底层工程底座之上的组合。见 [Playbooks](docs/cn/playbooks/overview.md)、[TriggerFlow 模型集成](docs/cn/triggerflow/model-integration.md) 和 [`examples/step_by_step/`](examples/step_by_step/)。
@@ -180,25 +187,25 @@ Agently.load_settings("yaml_file", "settings.yaml", auto_load_env=True)
 Prompt 由命名槽位组成。这样应用意图、约束、上下文和输出契约都可以被审阅：
 
 ```python
-response = (
+result = (
     agent
     .role("你是简洁的 release note 作者。")
-    .info({"version": "4.1.3.5", "audience": "framework users"})
+    .info({"version": "4.1.3.9", "audience": "framework users"})
     .instruct("只基于输入事实作答。")
     .input("为工程 changelog 总结这个发布线。")
     .output({
         "headline": (str, "短标题", True),
         "bullets": [(str, "一个稳定事实")],
     })
-    .get_response()
+    .get_result()
 )
 
-data = response.result.get_data()
-text = response.result.get_text()
-meta = response.result.get_meta()
+data = result.get_data()
+text = result.get_text()
+meta = result.get_meta()
 ```
 
-当同一次模型调用需要用多种方式读取时，使用 `get_response()`。
+当同一次模型调用需要用多种方式读取时，使用 `get_result()`。
 
 ### 2. 契约式输出控制
 
@@ -226,17 +233,17 @@ YAML 和 JSON prompt 文件也可以通过 `$ensure: true` 承载同样的契约
 Instant 事件允许 UI、服务或下游消费者在结构化字段变化时立刻响应：
 
 ```python
-response = (
+result = (
     agent
     .input("解释递归，并给两个示例。")
     .output({
         "definition": (str, "一句话定义", True),
         "examples": [(str, "带解释的示例")],
     })
-    .get_response()
+    .get_result()
 )
 
-for event in response.get_generator(type="instant"):
+for event in result.get_generator(type="instant"):
     if event.path == "definition" and event.delta:
         print(event.delta, end="", flush=True)
     if event.wildcard_path == "examples[*]" and event.is_complete:
@@ -261,14 +268,14 @@ def calculate_total(price: float, quantity: int) -> float:
 
 agent.use_actions(calculate_total)
 
-response = (
+result = (
     agent
     .input("使用可用 action 计算 19.5 * 4，并解释结果。")
-    .get_response()
+    .get_result()
 )
 
-print(response.result.get_text())
-print(response.result.full_result_data["extra"].get("action_logs", []))
+print(result.get_text())
+print(result.full_result_data["extra"].get("action_logs", []))
 ```
 
 常用能力 helper：
@@ -290,7 +297,7 @@ agent.use_actions(Search(timeout=15, backend="duckduckgo"))
 agent.use_actions(Browse())
 ```
 
-MCP server 使用 `agent.use_mcp(...)`。构建带显式托管资源的自定义后端时使用 `agent.register_action(..., executor=..., execution_environments=[...])`。
+MCP server 使用 `agent.use_mcp(...)`。构建带显式托管资源的自定义后端时使用 `agent.register_action(..., executor=..., execution_resources=[...])`。
 
 指令较重的 actions 会把后续模型上下文保持紧凑，只放 execution digest 和 artifact refs。应用如果需要完整代码、shell 输出、网页内容、SQL 行、截图或日志，可以显式读取 raw artifact：
 
@@ -339,7 +346,7 @@ execution = await agent.async_run_skills_task(
 研究 memo、QA 证据包、旅行计划或运营评审。应用代码只需要关注业务输入和输出契约，
 不需要手动 clone 远端仓库、解析 Skill 文件或逐个接工具。
 
-Skill 声明的 MCP、shell 和脚本能力会通过 Action Runtime 与 Execution Environment
+Skill 声明的 MCP、shell 和脚本能力会通过 Action Runtime 与 Execution Resource
 挂接，因此副作用仍然可观测、受策略控制。高风险本地执行需要审批或
 `auto_allow=True`；安全纯计算能力缺口可以合成为 sandboxed Python action；业务系统
 能力如果没有真实 connector，会 fail closed。
@@ -453,7 +460,7 @@ pip install agently-devtools
 agently-devtools init my_project
 ```
 
-Agently 4.1.3.5 推荐 `agently-devtools >=0.1.7,<0.2.0`。
+Agently 4.1.3.9 推荐 `agently-devtools >=0.1.10,<0.2.0`。
 
 ## 架构
 
@@ -468,9 +475,9 @@ graph TB
     Prompt["Prompt 槽位与输出 schema"]
     Agent["Agent 请求层"]
     Model["Model requester plugins"]
-    Response["ModelResponse: text, data, meta, stream"]
+    Result["ModelResponseResult: text, data, meta, stream"]
     Action["Action Runtime: planning, dispatch, logs"]
-    Env["Execution Environment: MCP, Python, Bash, Node, Browser, SQLite"]
+    Env["Execution Resource: MCP, Python, Bash, Node, Browser, SQLite"]
     Flow["TriggerFlow: branch, fan-out, stream, pause/resume, persist"]
     Observe["Observation events 与 DevTools"]
 
@@ -479,7 +486,7 @@ graph TB
     Settings --> Agent
     Prompt --> Agent
     Agent --> Model
-    Model --> Response
+    Model --> Result
     Agent --> Action
     Action --> Env
     App --> Flow
@@ -501,7 +508,7 @@ graph LR
     Runtime["ActionRuntime plugin\nplanning and call normalization"]
     Flow["ActionFlow plugin\naction loop and orchestration bridge"]
     Executor["ActionExecutor plugin\nfunction, MCP, sandbox, Search/Browse, custom"]
-    Env["ExecutionEnvironmentProvider\nresource lifecycle"]
+    Env["ExecutionResourceProvider\nresource lifecycle"]
     Logs["action_logs and artifacts"]
 
     Agent --> Facade
@@ -519,7 +526,7 @@ graph LR
 | Agent | custom agent extension 与 lifecycle hooks |
 | Request | prompt generator、model requester、response parser |
 | Actions | `ActionRuntime`、`ActionFlow`、`ActionExecutor` |
-| 托管资源 | `ExecutionEnvironmentProvider` |
+| 托管资源 | `ExecutionResourceProvider` |
 | Workflow | TriggerFlow chunks、conditions、events、runtime stream、persistence |
 | 观测 | event hookers、sinks、DevTools bridge |
 
@@ -593,7 +600,7 @@ Prompt 文件可以承载 Prompt 槽位和输出契约：
 | `examples/agent_auto_orchestration/` | 一次 Agent turn 协调 Actions、Skills、Dynamic Task 和过程流 |
 | `examples/skills_executor/` | 远程 Skills、effort-aware planning、MCP/script 挂接和 model pool 示例 |
 | `examples/action_runtime/` | function、MCP、sandbox、plugin action 示例 |
-| `examples/execution_environment/` | 托管 Python、Shell、Node、SQLite、Browser 和 provider 生命周期示例 |
+| `examples/execution_resource/` | 托管 Python、Shell、Node、SQLite、Browser 和 provider 生命周期示例 |
 | `examples/dynamic_task/` | Dynamic Task DAG 规划、校验和执行示例 |
 | `examples/trigger_flow/` | TriggerFlow 机制示例 |
 | `examples/builtin_actions/` | Search/Browse package 示例 |
@@ -676,7 +683,7 @@ CrewAI 和 AutoGen 在以 agent 协作为核心的设计里很强。Agently 是�
 | Model Response and Streaming | https://agently.tech/docs/en/requests/model-response.html |
 | Session Memory | https://agently.tech/docs/en/requests/session-memory.html |
 | Actions | https://agently.tech/docs/en/actions/overview.html |
-| Execution Environment | https://agently.tech/docs/en/actions/execution-environment.html |
+| Execution Resource | https://agently.tech/docs/en/actions/execution-environment.html |
 | TriggerFlow | https://agently.tech/docs/en/triggerflow/overview.html |
 | FastAPI Helper | https://agently.tech/docs/en/services/fastapi.html |
 | Observability | https://agently.tech/docs/en/observability/overview.html |
@@ -685,8 +692,8 @@ CrewAI 和 AutoGen 在以 agent 协作为核心的设计里很强。Agently 是�
 
 ## 兼容说明
 
-- 当前 package version 是 `4.1.3.5`。
-- 当前 release manifest 是 `compatibility/releases/4.1.3.5.json`。
+- 当前 package version 是 `4.1.3.9`。
+- 当前 release manifest 是 `compatibility/releases/4.1.3.9.json`。
 - 开发线计划写入 `compatibility/in-development.json`；不要把未来计划版本当作已发布版本。
 - README 示例使用当前 Action 和 TriggerFlow close-snapshot 路径。
 - deprecated API 默认每个 Python 进程只警告一次，除非关闭 `runtime.show_deprecation_warnings`。

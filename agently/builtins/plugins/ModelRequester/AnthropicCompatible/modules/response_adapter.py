@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from typing import Any, AsyncGenerator, cast
 
-from agently.types.data import AgentlyResponseGenerator
+from agently.types.data import AgentlyResultGenerator
 
 
 class AnthropicCompatibleResponseAdapterMixin:
@@ -84,7 +84,7 @@ class AnthropicCompatibleResponseAdapterMixin:
             return "length"
         return "stop"
 
-    async def broadcast_response(self, response_generator: AsyncGenerator) -> "AgentlyResponseGenerator":
+    async def broadcast_response(self, response_generator: AsyncGenerator) -> "AgentlyResultGenerator":
         meta: dict[str, Any] = {}
         content_buffer = ""
         reasoning_buffer = ""
@@ -103,6 +103,18 @@ class AnthropicCompatibleResponseAdapterMixin:
         async for event, message in response_generator:
             if event == "error":
                 yield "error", message
+                continue
+            if event == "status":
+                if isinstance(message, dict) and message.get("status") == "failed" and message.get("retry") is True:
+                    meta = {}
+                    content_buffer = ""
+                    reasoning_buffer = ""
+                    message_record = {}
+                    content_blocks = {}
+                    tool_call_states = {}
+                    completed = False
+                    saw_any_event = False
+                yield "status", message
                 continue
 
             saw_any_event = True

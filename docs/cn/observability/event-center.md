@@ -21,9 +21,27 @@ Event Center 是 Agently 的框架级运行时事件通道。它承载 **Runtime
 
 run 与 retry 命名：
 
-- `agent_turn` 是一次 Agent 面向用户/调用方回合的 run lineage 类型。
-- `attempt_index` 描述一次请求内部的模型重试 attempt；它不是 Agent turn 计数。
-- DevTools 应保持两者语义分离：从 `run.run_kind` 渲染 `agent_turn`，从 `model_request` run 的 `payload.attempt_index` 或 `run.meta.attempt_index` 读取模型重试 attempt。
+- `agent_execution` 是一次 AgentExecution-owned Agent run 的 run lineage 类型。
+- `attempt_index` 描述一次请求内部的模型重试 attempt；它不是 AgentExecution 计数。
+- DevTools 应保持两者语义分离：从 `run.run_kind` 渲染 `agent_execution`，从 `model_request` run 的 `payload.attempt_index` 或 `run.meta.attempt_index` 读取模型重试 attempt。
+
+模型请求 telemetry：
+
+- 模型 RuntimeEvent 可在 `model.request_started`、`model.requesting`、`model.status`、`model.completed`、`model.meta`、`model.request_failed`、`model.requester.error` 上携带 `payload["model_request_telemetry"]`。
+- telemetry payload 只用于观察，可包含 `response_id`、`attempt_index`、run ids、provider/model、request URL、duration、raw usage、归一化 usage summary、输入/输出字符长度估算、side-channel 和规范化 error 事实。
+- telemetry 去重只移除同一 `response_id + attempt_index + event kind` 的重复 telemetry 子 payload；不会抑制原始 RuntimeEvent。
+- 不要把这些 telemetry 事实反馈给 route 选择、retry policy、verifier 判断、quality scoring、planner context 或 prompt 内容。它们只用于日志、DevTools 展示和诊断。
+
+模型请求状态：
+
+- `model.status` 记录一次 ModelRequest attempt 的结果事实，只用于观察；它不决定 retry 或下游控制流。
+- 原始 response stream 使用 `("status", payload)`；`instant` / `streaming_parse` 使用 `StreamingData(path="$status", value=payload)`。
+- `payload["status"]` 为 `completed`、`failed` 或 `cancelled`。
+- `failed` 且 `retry=true` 表示 `payload["attempt_index"]` 的 partial 输出已失效，下一次 attempt 是 `payload["next_attempt_index"]`。消费者应先清除临时输出，再渲染替代 attempt 的 delta。
+- `reason` 包含有界的 provider/transport 实际说明；有异常对象时 `error_type` 为原始异常类型。它不包含 traceback 或原始 request body。
+- 纯文本 `type="delta"` generator 会在同一重放边界输出独立的
+  `"<$retry>{reason}</$retry>"` chunk；消费者必须据此清除临时文本。需要 lineage 或
+  无碰撞结构化事实时，应使用 `type="all"`、`specific`、`instant` 或 `streaming_parse`。
 
 ## 注册 hook
 
@@ -83,7 +101,7 @@ event loop 的兜底，不替代 CLI/script 退出前的显式 flush。
 ## 发送 runtime event
 
 `model.*`、`request.*`、`action.*`、`tool.*`、`session.*`、
-`agent_turn.*`、`triggerflow.*`、`execution_environment.*` 这类 Agently
+`agent_execution.*`、`triggerflow.*`、`execution_resource.*` 这类 Agently
 官方事件类型由 core 运行时协调器产出。自定义插件和应用可以向 Event Center
 发送自己的消息，但应该使用应用/插件自有命名空间，也不能依赖 Agently 官方模块
 消费这些自定义消息。
@@ -150,6 +168,23 @@ await Agently.async_emit_runtime({
 | `meta` | 附加元数据 |
 | `timestamp` | 毫秒时间戳 |
 
+对于模型请求事件，`payload.model_request_telemetry` 是可扩展子 payload。消费者应把缺失字段视为未知，而不是失败。常见字段：
+
+| 字段 | 含义 |
+|---|---|
+| `event_kind` | 携带该 telemetry 的原始模型事件类型 |
+| `telemetry_key` | 去重 key，通常是 `response_id:attempt_index:event_kind` |
+| `response_id` | request/response 关联 id |
+| `attempt_index` | 请求内部的 retry attempt 编号 |
+| `request_run_id` / `model_run_id` | request 与 model attempt 的 run lineage id |
+| `provider` / `provider_family` / `model` | 可得的 provider 元数据 |
+| `request_url` | provider endpoint 或 provider 自有 symbolic URL |
+| `duration_ms` | 可得时从模型请求开始计算的耗时 |
+| `usage` | provider 上报的 usage 元数据 |
+| `usage_summary` | 只用于观察的 usage 摘要，包含归一化 provider token 字段和输入/输出字符长度估算；终态 `model.status` 可携带估算长度而不暴露 raw request payload；provider token 缺失时展示为未知，而不是失败 |
+| `side_channel` | 是否来自 side-channel request 路径 |
+| `error` | failed/requester-error 事件上的规范化错误事实 |
+
 ## TriggerFlow 事件别名
 
 Event Center 会兼容 TriggerFlow 历史事件前缀。订阅 `workflow.execution_started` 可以收到 `triggerflow.execution_started`；订阅 `trigger_flow.signal` 可以收到 `triggerflow.signal`。文档和新代码优先写 `triggerflow.*`。
@@ -172,9 +207,9 @@ Action Runtime 生命周期事件以 `action.*` 作为主命名空间。当当�
 `action.approval_required` 或 `action.blocked`，不会再被记录成普通失败。
 对于 tool-backed action，`payload.action_type` 可以是 `"tool"`；这不会改变事件 family。
 
-## Execution Environment 事件
+## ExecutionResource 事件
 
-Execution Environment 生命周期使用 `execution_environment.*`。Provider 与 DevTools
+ExecutionResource 生命周期使用 `execution_resource.*`。Provider 与 DevTools
 消费者都应把这个 namespace 当作可扩展协议处理。当前 manager 事件包括 `declared`、
 `approval_required`、`ensuring`、`ready`、`unhealthy`、`releasing`、`released`
 和 `failed`。`unhealthy` 表示 ready handle 在复用前 health check 失败；manager 会释放它并
@@ -193,7 +228,8 @@ AgentExecution 会把进展记录在 `async_get_meta()["diagnostics"]`：
 - `diagnostics["stalls"]` 记录 idle 无进展卡死。
 
 调试线上或本地应用时，可以临时挂 Event Center hook，或用
-`.set_settings("debug", True)` / `.set_settings("debug", "detail")` 打开控制台明细。
+`.set_settings("debug", True)` 打开请求/结果与过程摘要，用
+`.set_settings("debug", "detail")` 打开完整 observation 与模型 delta 输出。
 问题定位后，应从代码中移除临时 debug hook 和 debug settings。
 
 ## 兼容约束

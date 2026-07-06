@@ -54,16 +54,26 @@ from .request import (
 
 from .response import (
     AgentExecutionStreamData,
+    AgentExecutionStreamHandler,
+    AgentlyOriginalResultPayload,
+    AgentlyOriginalResponsePayload,
     AgentlyModelResult,
+    AgentlyModelResultEvent,
+    AgentlyModelResultMessage,
     AgentlyModelResponseEvent,
     AgentlyModelResponseMessage,
+    AgentlySpecificResultMessage,
+    AgentlySpecificResponseMessage,
+    AgentlyResultGenerator,
     AgentlyResponseGenerator,
     InstantStreamingContentType,
+    ModelStreamingHandler,
     NormalStreamingContentType,
     OutputValidateContext,
     OutputValidateHandler,
     OutputValidateResult,
     OutputValidateResultDict,
+    ResultContentType,
     ResponseContentType,
     SpecificEvents,
     StreamingContentType,
@@ -105,6 +115,19 @@ from .task_dag import (
     TaskDAGNode,
 )
 
+from .task_board import (
+    TASK_BOARD_SCHEMA_VERSION,
+    TaskBoardCard,
+    TaskBoardCardFailurePolicy,
+    TaskBoardCardResult,
+    TaskBoardCardStatus,
+    TaskBoardGraph,
+    TaskBoardPatch,
+    TaskBoardRevision,
+    TaskBoardSchedulePlan,
+    TaskBoardStatus,
+)
+
 from .action import (
     ActionApproval,
     ActionArtifact,
@@ -121,14 +144,69 @@ from .action import (
     ActionStatus,
 )
 
-from .execution_environment import (
-    ExecutionEnvironmentDecision,
-    ExecutionEnvironmentHandle,
-    ExecutionEnvironmentKind,
-    ExecutionEnvironmentPolicy,
-    ExecutionEnvironmentRequirement,
-    ExecutionEnvironmentScope,
-    ExecutionEnvironmentStatus,
+from .capability import (
+    CapabilityRiskLevel,
+    CapabilitySideEffectDescriptor,
+    CapabilitySideEffectOwner,
+)
+
+from .execution_resource import (
+    ExecutionResourceDecision,
+    ExecutionResourceHandle,
+    ExecutionResourceKind,
+    ExecutionResourcePolicy,
+    ExecutionResourceRequirement,
+    ExecutionResourceScope,
+    ExecutionResourceStatus,
+)
+
+from .execution_plan import (
+    PREFERRED_EXECUTION_SHAPES,
+    PLAN_BLOCK_INSTANCE_KINDS,
+    EVIDENCE_BODY_STATES,
+    EVIDENCE_ITEM_STATUSES,
+    EXECUTION_PLAN_SCHEMA_VERSION,
+    REPLAN_STATUSES,
+    CapabilityResolution,
+    EvidenceEnvelope,
+    EvidenceBodyState,
+    EvidenceItemStatus,
+    ExecutionPlanEdge,
+    ExecutionPlan,
+    PlanBlockInstance,
+    PlanBlockInstanceKind,
+    PreferredExecutionShape,
+    ReplanSignal,
+    ReplanStatus,
+    SkillActivation,
+    TaskFrame,
+)
+
+from .blocks import (
+    BLOCKS_SCHEMA_VERSION,
+    BLOCK_COMPOSITIONS,
+    EXECUTION_BLOCK_KINDS,
+    PLAN_BLOCK_KINDS,
+    STANDARD_BLOCK_SIGNALS,
+    BlockCompileRequest,
+    BlockComposition,
+    BlockSignal,
+    EvidenceMapper,
+    ExecutionBlock,
+    ExecutionBlockEdge,
+    ExecutionBlockGraph,
+    ExecutionBlockKind,
+    PlanBlock,
+    PlanBlockKind,
+    ResultAdapter,
+    StandardBlockSignal,
+)
+
+from .execution_exchange import (
+    ExecutionExchangeDispatchState,
+    ExecutionExchangeProviderResult,
+    ExecutionExchangeRequest,
+    ExecutionExchangeWaitMode,
 )
 
 from .policy_approval import (
@@ -141,6 +219,11 @@ from .policy_approval import (
 
 from .skill import (
     ExecutionStrategy,
+    SkillContextPack,
+    SkillContextPackIncludeMode,
+    SkillContextPackIntent,
+    SkillContextPackResource,
+    SkillContextPackSkill,
     SkillCapabilityNeed,
     SkillCard,
     SkillContract,
@@ -149,6 +232,8 @@ from .skill import (
     SkillExecutionPlan,
     SkillExecutionStatus,
     SkillMode,
+    SkillRuntimeStreamHandler,
+    SkillRuntimeStreamItem,
     SkillsPackRecord,
     SkillPlanRejection,
     SkillPlanSelection,
@@ -156,12 +241,32 @@ from .skill import (
 
 from .workspace import (
     WorkspaceBackendCapabilities,
+    WorkspaceContentSegment,
     WorkspaceContextItem,
     WorkspaceContextOmission,
-    WorkspaceContextPack,
+    WorkspaceContextPackage,
+    WorkspaceRetrievalItem,
+    WorkspaceRetrievalMethod,
+    WorkspaceRetrievalOmission,
+    WorkspaceRetrievalPackage,
+    WorkspaceRetrievalSelection,
+    WorkspaceRetrievalSource,
+    WorkspaceFileDiagnostic,
+    WorkspaceFileExportResult,
+    WorkspaceFileInfo,
+    WorkspaceFileOperation,
+    WorkspaceFilePolicyMetadata,
+    WorkspaceFileReadResult,
+    WorkspaceFileRef,
+    WorkspaceFileWriteResult,
+    WorkspaceLeaseRef,
     WorkspaceLinkRef,
-    WorkspaceRecallPlan,
+    WorkspaceContextPlan,
     WorkspaceRecordRef,
+    WorkspaceReferenceEnvelope,
+    WorkspaceRetentionAnchor,
+    WorkspaceRuntimeEventRecord,
+    WorkspaceScratchLease,
     WorkspaceSearchResult,
 )
 
@@ -170,11 +275,17 @@ from .agent_execution import (
     AgentExecutionLineage,
     AgentExecutionLimits,
     AgentExecutionMeta,
-    AgentExecutionMode,
     AgentExecutionStatus,
     AgentExecutionStreamMeta,
     AgentExecutionWorkspaceRecord,
     AgentExecutionWorkspaceRefs,
+    CapabilityKind,
+    CapabilityRoute,
+    EvidenceRequirement,
+    EvidenceRequirementKind,
+    GuidanceAccess,
+    PlannerCapabilityCandidate,
+    PlannerCapabilitySummary,
 )
 
 from .attempt import (
@@ -183,4 +294,6 @@ from .attempt import (
     AttemptHandlers,
     AttemptObservation,
     AttemptState,
+    AttemptStreamGenerator,
+    AttemptStreamMessage,
 )

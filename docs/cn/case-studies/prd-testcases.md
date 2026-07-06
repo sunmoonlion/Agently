@@ -119,8 +119,8 @@ UI 边生成边显示时，把每需求的用例推到 runtime stream：
 ```python
 async def cases_for_one(data):
     req = data.input
-    response = agent.info({"requirement": req}, always=False).input("...").output({...}).get_response()
-    async for item in response.get_async_generator(type="instant"):
+    result = agent.info({"requirement": req}, always=False).input("...").output({...}).get_result()
+    async for item in result.get_async_generator(type="instant"):
         if item.delta:
             await data.async_put_into_stream({
                 "req_id": req["id"],
@@ -128,7 +128,7 @@ async def cases_for_one(data):
                 "delta": item.delta,
                 "done": item.is_complete,
             })
-    return await response.async_get_data()
+    return await result.async_get_data()
 ```
 
 `execution.get_async_runtime_stream(...)` 消费者看到按需求按字段的进度。见 [事件与流](../triggerflow/events-and-streams.md)。
@@ -151,7 +151,7 @@ def all_requirements_covered(result, ctx):
 
 ### 长 PRD 的保存恢复
 
-很长的 PRD（50+ 需求）运行可能足够长，值得 checkpoint。换 `flow.create_execution(auto_close=False)`，`list_requirements` 后保存，恢复继续 for_each。见 [持久化与 Blueprint](../triggerflow/persistence-and-blueprint.md)。
+很长的 PRD（50+ 需求）运行可能足够长，值得持久化 execution snapshot。换 `flow.create_execution(auto_close=False)`，`list_requirements` 后保存，恢复继续 for_each。见 [持久化与 Blueprint](../triggerflow/persistence-and-blueprint.md)。
 
 ## 交叉链接
 

@@ -17,7 +17,7 @@ TriggerFlow execution 携带三种独立的存储层。它们看起来类似，�
 | Scope | execution-local | flow 共享（所有 execution 之间） | execution-local |
 | 可序列化 | 是 | 是 | **否** |
 | 进 close snapshot | 是 | 否 | 否，仅记录 `resource_keys` |
-| 进 save / load checkpoint | 是 | 否 | 否，`load()` 后必须重新注入 |
+| 进 execution snapshot | 是 | 否 | 否，`load()` 后必须重新注入 |
 | 推荐用途 | 业务 state、中间值、`close()` 想拿到的内容 | 历史兼容 / 显式有意的 flow 范围共享 | live client、socket、callback、文件句柄、cache 引用 |
 | 状态 | **推荐主路径** | risky-default —— 每次调用发 `RuntimeWarning` | 新概念 —— 不可序列化的内容都用这个 |
 
@@ -100,30 +100,61 @@ async def step(data: TriggerFlowRuntimeData):
 
 ### 为什么 resources 不进 snapshot
 
-close snapshot 应当是可序列化的 dict。live 对象不能序列化（没有有意义的表示，也没法在另一边重建 live 状态）。snapshot **会**记录 `resource_keys` —— execution 持有过的 resource 名 —— 这样恢复时知道要重新注入什么：
+close snapshot 应当是可序列化的 dict。live 对象不能序列化（没有有意义的表示，也没法在另一边重建 live 状态）。snapshot **会**记录 `resource_keys` 与 `resource_requirements` —— 恢复所需的 resource identity：
 
 ```python
-saved = execution.save()
-# saved 含 state、lifecycle metadata、interrupt state、resource_keys
-# 但不含 live 对象本体
+flow.declare_resource_requirement("db")
+flow.declare_resource_requirement("logger")
+flow.declare_resource_requirement("search_tool")
 
-restored = flow.create_execution(
-    auto_close=False,
+saved = execution.save()
+# saved 含 state、lifecycle metadata、interrupt state、
+# resource requirements 和 resource keys，但不含 live 对象本体
+
+restored = flow.create_execution(auto_close=False)
+await restored.async_load(
+    saved,
     runtime_resources={"db": new_db_client, "logger": new_logger, "search_tool": search_function},
 )
-restored.load(saved)
 ```
 
-`load()` 后调用方负责重新注入兼容的 resource。
+调用方负责在 load 时重新注入所需 resource。所需 resource 已经在当前进程里可用时使用
+`load(saved)`；重启和 worker handoff 路径使用 `async_load(...)`，这样缺失资源会在
+execution 继续前失败。
+
+对分布式 pause/resume 来说，resource 如果自己带状态，重新注入还不够。重新创建一个
+HTTP client 可以和旧对象等价，但 browser page、sandbox process、remote task 或
+exchange session 可能需要 provider-owned state ref、version、lease 或 fence token。
+这些 ref 应进入 execution state 或 resource requirements，并由外部系统在 TriggerFlow
+继续前恢复和校验 live object。
+
+在每个 worker 都能导入同一个 factory 的服务部署中，可以声明 importable resolver
+descriptor，让 `async_load(...)` 重建 live object：
+
+```python
+flow.declare_resource_requirement(
+    "db",
+    resolver="my_app.resources:create_db",
+    provider_kind="database",
+    config_ref="settings://db",
+    secret_ref="secret://db",
+)
+```
+
+resolver 会收到 context dict，并返回 live object 或
+`{"resource": object, "health": "healthy"}`。缺失、unhealthy 和
+policy-forbidden resource 会出现在 `inspect_load(...)` diagnostics 中；
+`fail_policy="fail_open"` 会把阻断型 resolver 问题降级为 warning，默认
+`fail_closed` 会阻断严格 load。
 
 ### 托管 execution resources
 
 当你向 `flow.create_execution(...)`、`flow.start_execution(...)` 或
-`flow.async_start(...)` 传入 `execution_environments=[...]` 时，
-`runtime_resources` 也可以接收来自 `Agently.execution_environment` 的托管资源。
+`flow.async_start(...)` 传入 `execution_resources=[...]` 时，
+`runtime_resources` 也可以接收来自 `Agently.execution_resource` 的托管资源。
 
 chunk 内仍然通过 `data.require_resource(...)` 读取。差异在 ownership：
-Execution Environment Manager 负责启动/复用资源，并在 execution close 时释放。
+ExecutionResourceManager 负责启动/复用资源，并在 execution close 时释放。
 手动传入的 `runtime_resources={...}` 仍是 unmanaged。
 
 ## 决策表
@@ -134,7 +165,8 @@ Execution Environment Manager 负责启动/复用资源，并在 execution close
 | pydantic 模型、dataclass，或任何可序列化为 dict 的 | `state` |
 | DB client、HTTP client、websocket | `runtime_resources` |
 | 函数或回调 | `runtime_resources` |
-| 跨 execution 共享、有意全局的内存 cache | flow 级 `runtime_resources`（注意进程重启需要重注入） |
+| 跨 execution 共享、有意全局的内存 cache | flow 级 `runtime_resources`（注意进程重启需要重注入，或把 cache state 外部化） |
+| 必须跨 worker handoff 存活的有状态 session | `runtime_resources` 加 durable external state ref 和 resolver/provider validation |
 | 跨 execution 共享、有意全局的配置 | `flow_data`（带 `no_warning=True`），或 `runtime_resources`（不可序列化时） |
 
 ## 常见错误
@@ -142,10 +174,12 @@ Execution Environment Manager 负责启动/复用资源，并在 execution close
 - **把 SDK client 放进 state**：要么序列化失败，要么悄悄抓了一份过期 snapshot。用 `runtime_resources`。
 - **把单 execution 业务数据放进 `flow_data`**：两个并发 execution 互相覆盖。用 `state`。
 - **`load()` 后忘记重新注入 `runtime_resources`**：execution 在 `require_resource(...)` 处崩。snapshot 里有 `resource_keys` —— 写一段不会漂移的重注入逻辑。
+- **因为 resource key 存在就认为有状态 resource 已恢复**：key 存在只证明当前进程挂了 live object。这个 object 携带的状态仍需要外部系统恢复和校验。
 
 ## 另见
 
 - [Lifecycle](lifecycle.md) —— `close()` 返回什么
-- [Execution Environment](../actions/execution-environment.md) —— 托管 live resource 生命周期
+- [ExecutionResource](../actions/execution-environment.md) —— 托管 live resource 生命周期
 - [持久化与 Blueprint](persistence-and-blueprint.md) —— `save` / `load` 语义
+- [分布式 Pause 与 Resume 边界](distributed-pause-resume.md) —— 宿主管理恢复和 live object ownership
 - [兼容](compatibility.md) —— `runtime_data` 是 `state` 的 deprecated 别名

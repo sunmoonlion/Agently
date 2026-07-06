@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any, cast
 
-from agently.core.orchestration.TaskDAGExecutor import (
+from agently.core.orchestration.TaskDAG import (
     _GRAPH_SCHEMA_VERSION,
     _TASK_ID_PATTERN,
     TaskDAGValidator,
@@ -77,7 +77,9 @@ TASK_DAG_PLANNER_OUTPUT_SCHEMA: dict[str, Any] = {
             ),
             "fallback": (
                 dict,
-                "Fallback policy such as {'on_error': 'skip'} or {'on_error': 'fail'}.",
+                "Fallback policy: {'on_error': 'skip'}, {'on_error': 'fail'}, or "
+                "{'on_error': 'retry', 'max_attempts': N, 'then': 'skip'|'fail'} for "
+                "idempotent tasks that may hit transient failures.",
             ),
             "approval": (
                 dict,

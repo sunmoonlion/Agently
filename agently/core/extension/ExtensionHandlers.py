@@ -19,9 +19,9 @@ from agently.utils import StateData
 
 if TYPE_CHECKING:
     from agently.core import Prompt
-    from agently.core.model.ModelRequest import ModelResponseResult
+    from agently.core.model import ModelRequestResult
     from agently.utils import Settings
-    from agently.types.data import AgentlyModelResponseEvent, AgentlyModelResult, OutputValidateHandler
+    from agently.types.data import AgentlyModelResultEvent, AgentlyModelResult, OutputValidateHandler
 
 
 class ExtensionHandlers(StateData):
@@ -41,15 +41,15 @@ class ExtensionHandlers(StateData):
     def append(
         self,
         key: Literal["broadcast_suffixes"],
-        value: "Callable[[AgentlyModelResponseEvent, Any, AgentlyModelResult, Settings], Any]",
+        value: "Callable[[AgentlyModelResultEvent, Any, AgentlyModelResult, Settings], Any]",
         *,
-        event: "AgentlyModelResponseEvent",
+        event: "AgentlyModelResultEvent",
     ): ...
     @overload
     def append(
         self,
         key: Literal["finally"],
-        value: "Callable[[ModelResponseResult, Settings], Any]",
+        value: "Callable[[ModelRequestResult, Settings], Any]",
     ): ...
     @overload
     def append(

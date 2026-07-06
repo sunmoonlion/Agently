@@ -15,6 +15,7 @@
 import uuid
 import asyncio
 import warnings
+import copy
 from pathlib import Path
 
 from typing import Callable, Any, Literal, TYPE_CHECKING, overload, AsyncGenerator, Generator, Generic, TypeVar, cast
@@ -22,7 +23,7 @@ from typing import Callable, Any, Literal, TYPE_CHECKING, overload, AsyncGenerat
 if TYPE_CHECKING:
     from .Execution import TriggerFlowExecution
     from .Chunk import TriggerFlowHandler
-    from agently.types.data import ExecutionEnvironmentRequirement, RunContext, SerializableValue
+    from agently.types.data import ExecutionResourceRequirement, RunContext, SerializableValue
 
 from agently.types.trigger_flow import (
     TriggerFlowBlockData,
@@ -73,10 +74,12 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
         self._runtime_resources = StateData(
             name=f"TriggerFlow-{ self.name }-RuntimeResources",
         )
+        self._resource_requirements: list[dict[str, Any]] = []
         self._blue_print = blueprint if blueprint is not None else TriggerFlowBlueprint()
         self._skip_exceptions = skip_exceptions
         self._executions: dict[str, "TriggerFlowExecution[InputT, StreamT, ResultT]"] = {}
         self._contract = TriggerFlowContract[InputT, StreamT, ResultT]()
+        self._contract_metadata: TriggerFlowContractMetadata | None = None
         self.set_settings = self.settings.set_settings
         self.load_settings = self.settings.load
 
@@ -95,6 +98,7 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
         self.del_runtime_resource = self._del_runtime_resource
         self.update_runtime_resources = self._update_runtime_resources
         self.clear_runtime_resources = self._clear_runtime_resources
+        self.declare_resource_requirement = self._declare_resource_requirement
         self._bind_start_process()
 
     def _bind_start_process(self):
@@ -138,6 +142,85 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
             return None
         return intervention_mode
 
+    def _default_execution_workspace_root(self, run_context: "RunContext | None" = None) -> Path:
+        from agently.core.workspace._defaults import default_physical_root
+
+        session_id = getattr(run_context, "session_id", None)
+        return default_physical_root(session_id=str(session_id) if session_id else None)
+
+    def _default_execution_workspace_scope(
+        self,
+        execution_id: str,
+        run_context: "RunContext | None" = None,
+    ) -> dict[str, Any]:
+        from agently.core.workspace._defaults import script_scope
+
+        scope: dict[str, Any] = {
+            "execution_id": execution_id,
+            "flow_name": self.name,
+        }
+        session_id = getattr(run_context, "session_id", None)
+        if session_id:
+            scope["session_id"] = str(session_id)
+        else:
+            scope["script_scope"] = script_scope()
+        return scope
+
+    def _default_execution_workspace_search_scope(
+        self,
+        execution_id: str,
+        run_context: "RunContext | None" = None,
+    ) -> dict[str, Any]:
+        # Default search is execution-isolated: a default execution Workspace
+        # search / context build only sees its own execution's records, even
+        # though sibling executions in the same session/script share the physical
+        # workspace.db. Cross-execution recall requires an explicit scope (spec:
+        # explicit cross-scope search/read/link/context build).
+        return {"execution_id": execution_id}
+
+    def _create_execution_workspace_resource(self, execution_id: str, run_context: "RunContext | None" = None):
+        from agently.base import workspace as global_workspace
+        from agently.core.workspace import LazyWorkspace
+        from agently.core.workspace._defaults import lineage_files_root, scope_node
+
+        root = self._default_execution_workspace_root(run_context)
+        # A directly started flow execution is a lineage root: tasks/actions/
+        # nested executions created within it nest under this execution node and
+        # share one prunable subtree (spec section 8.2).
+        execution_lineage = [scope_node("executions", execution_id)]
+        return LazyWorkspace(
+            global_workspace,
+            root,
+            files_root=lineage_files_root(root, execution_lineage),
+            default_scope=self._default_execution_workspace_scope(execution_id, run_context),
+            default_search_scope=self._default_execution_workspace_search_scope(execution_id, run_context),
+            scope_lineage=execution_lineage,
+        )
+
+    def _coerce_execution_workspace_resource(self, workspace: Any):
+        from agently.base import workspace as global_workspace
+        from agently.core.workspace import LazyWorkspace, Workspace
+
+        if isinstance(workspace, (Workspace, LazyWorkspace)):
+            return workspace
+        return global_workspace.create(workspace)
+
+    def _resolve_execution_runtime_resources(
+        self,
+        execution_id: str,
+        runtime_resources: dict[str, Any] | None,
+        workspace: Any,
+        run_context: "RunContext | None" = None,
+    ) -> dict[str, Any]:
+        resolved = dict(runtime_resources or {})
+        if workspace is False:
+            resolved.pop("workspace", None)
+        elif workspace is None:
+            resolved.setdefault("workspace", self._create_execution_workspace_resource(execution_id, run_context))
+        else:
+            resolved["workspace"] = self._coerce_execution_workspace_resource(workspace)
+        return resolved
+
     @overload
     def chunk(self, handler_or_name: "TriggerFlowHandler") -> TriggerFlowChunk: ...
 
@@ -171,7 +254,8 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
         skip_exceptions: bool | None = None,
         concurrency: int | None = None,
         runtime_resources: dict[str, Any] | None = None,
-        execution_environments: "list[ExecutionEnvironmentRequirement] | None" = None,
+        workspace: Any = None,
+        execution_resources: "list[ExecutionResourceRequirement] | None" = None,
         run_context: "RunContext | None" = None,
         parent_run_context: "RunContext | None" = None,
         auto_close: bool = True,
@@ -210,13 +294,19 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
             auto_close_timeout=auto_close_timeout,
             owner_id=owner_id,
             lease_ttl=lease_ttl,
-            execution_environments=execution_environments,
+            execution_resources=execution_resources,
             intervention_mode=intervention_mode,
             intervention_policy=intervention_policy,
             resume_handle_exposed=resume_handle_exposed,
         )
-        if runtime_resources:
-            execution.update_runtime_resources(runtime_resources)
+        execution_runtime_resources = self._resolve_execution_runtime_resources(
+            execution_id,
+            runtime_resources,
+            workspace,
+            execution_run_context,
+        )
+        if execution_runtime_resources:
+            execution.update_runtime_resources(execution_runtime_resources)
         self._executions[execution_id] = execution
         return cast("TriggerFlowExecution[InputT, StreamT, ResultT]", execution)
 
@@ -302,6 +392,7 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
             result=result,
             meta=meta,
         )
+        self._contract_metadata = None
         self._blue_print.definition.contract = self._contract.export_metadata()
         return self
 
@@ -309,7 +400,14 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
         return self._contract.snapshot()
 
     def get_contract_metadata(self) -> TriggerFlowContractMetadata:
+        if self._contract_metadata is not None:
+            return copy.deepcopy(self._contract_metadata)
         return self._contract.export_metadata()
+
+    def _sync_contract_from_blueprint(self):
+        self._contract = TriggerFlowContract[InputT, StreamT, ResultT]()
+        contract_metadata = self._blue_print.definition.contract
+        self._contract_metadata = copy.deepcopy(contract_metadata) if contract_metadata else None
 
     def _set_runtime_resource(self, key: str, value: Any):
         self._runtime_resources.set(str(key), value)
@@ -337,6 +435,56 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
     def _clear_runtime_resources(self):
         self._runtime_resources.clear()
         return self
+
+    def _declare_resource_requirement(
+        self,
+        key: str,
+        *,
+        kind: str = "runtime_resource",
+        required: bool = True,
+        metadata: dict[str, Any] | None = None,
+        resolver: str | None = None,
+        provider_kind: str | None = None,
+        secret_ref: str | None = None,
+        config_ref: str | None = None,
+        resolver_version: str | None = None,
+        resolver_fingerprint: str | None = None,
+        health: str | None = None,
+        fail_policy: str | None = None,
+    ):
+        requirement = {
+            "kind": str(kind),
+            "key": str(key),
+            "required": bool(required),
+            "source": "flow",
+            "metadata": {"scope": "flow", **dict(metadata or {})},
+        }
+        for field, value in (
+            ("resolver", resolver),
+            ("provider_kind", provider_kind),
+            ("secret_ref", secret_ref),
+            ("config_ref", config_ref),
+            ("resolver_version", resolver_version),
+            ("resolver_fingerprint", resolver_fingerprint),
+            ("health", health),
+            ("fail_policy", fail_policy),
+        ):
+            if value is not None:
+                requirement[field] = str(value)
+        self._resource_requirements = [
+            item
+            for item in self._resource_requirements
+            if not (
+                item.get("kind") == requirement["kind"]
+                and item.get("key") == requirement["key"]
+                and item.get("source") == requirement["source"]
+            )
+        ]
+        self._resource_requirements.append(requirement)
+        return self
+
+    def get_resource_requirements(self):
+        return copy.deepcopy(self._resource_requirements)
 
     def remove_execution(self, execution: "TriggerFlowExecution | str"):
         if isinstance(execution, str):
@@ -418,7 +566,8 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
         timeout: float | None = None,
         concurrency: int | None = None,
         runtime_resources: dict[str, Any] | None = None,
-        execution_environments: "list[ExecutionEnvironmentRequirement] | None" = None,
+        workspace: Any = None,
+        execution_resources: "list[ExecutionResourceRequirement] | None" = None,
         run_context: "RunContext | None" = None,
         parent_run_context: "RunContext | None" = None,
         auto_close: bool = True,
@@ -440,13 +589,14 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
         execution = self.create_execution(
             concurrency=concurrency,
             runtime_resources=runtime_resources,
+            workspace=workspace,
             run_context=run_context,
             parent_run_context=parent_run_context,
             auto_close=auto_close,
             auto_close_timeout=effective_auto_close_timeout,
             owner_id=owner_id,
             lease_ttl=lease_ttl,
-            execution_environments=execution_environments,
+            execution_resources=execution_resources,
             intervention_mode=intervention_mode,
             intervention_policy=intervention_policy,
             resume_handle_exposed=resume_handle_exposed,
@@ -471,7 +621,8 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
                 self._flow_data.append(key, value)
                 value = self._flow_data[key]
             case "del":
-                if self._flow_data.get(key, None):
+                missing = object()
+                if self._flow_data.get(key, missing) is not missing:
                     del self._flow_data[key]
                     value = None
                 else:
@@ -533,7 +684,8 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
         timeout: float | None = None,
         concurrency: int | None = None,
         runtime_resources: dict[str, Any] | None = None,
-        execution_environments: "list[ExecutionEnvironmentRequirement] | None" = None,
+        workspace: Any = None,
+        execution_resources: "list[ExecutionResourceRequirement] | None" = None,
         run_context: "RunContext | None" = None,
         parent_run_context: "RunContext | None" = None,
         auto_close: bool = True,
@@ -551,7 +703,8 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
         timeout: float | None = None,
         concurrency: int | None = None,
         runtime_resources: dict[str, Any] | None = None,
-        execution_environments: "list[ExecutionEnvironmentRequirement] | None" = None,
+        workspace: Any = None,
+        execution_resources: "list[ExecutionResourceRequirement] | None" = None,
         run_context: "RunContext | None" = None,
         parent_run_context: "RunContext | None" = None,
         auto_close: bool = True,
@@ -568,7 +721,8 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
         timeout: float | None = None,
         concurrency: int | None = None,
         runtime_resources: dict[str, Any] | None = None,
-        execution_environments: "list[ExecutionEnvironmentRequirement] | None" = None,
+        workspace: Any = None,
+        execution_resources: "list[ExecutionResourceRequirement] | None" = None,
         run_context: "RunContext | None" = None,
         parent_run_context: "RunContext | None" = None,
         auto_close: bool = True,
@@ -582,7 +736,8 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
             timeout=timeout,
             concurrency=concurrency,
             runtime_resources=runtime_resources,
-            execution_environments=execution_environments,
+            workspace=workspace,
+            execution_resources=execution_resources,
             run_context=run_context,
             parent_run_context=parent_run_context,
             auto_close=auto_close,
@@ -600,7 +755,8 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
         timeout: float | None = None,
         concurrency: int | None = None,
         runtime_resources: dict[str, Any] | None = None,
-        execution_environments: "list[ExecutionEnvironmentRequirement] | None" = None,
+        workspace: Any = None,
+        execution_resources: "list[ExecutionResourceRequirement] | None" = None,
         run_context: "RunContext | None" = None,
         parent_run_context: "RunContext | None" = None,
         auto_close: bool = True,
@@ -618,7 +774,8 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
         timeout: float | None = None,
         concurrency: int | None = None,
         runtime_resources: dict[str, Any] | None = None,
-        execution_environments: "list[ExecutionEnvironmentRequirement] | None" = None,
+        workspace: Any = None,
+        execution_resources: "list[ExecutionResourceRequirement] | None" = None,
         run_context: "RunContext | None" = None,
         parent_run_context: "RunContext | None" = None,
         auto_close: bool = True,
@@ -635,7 +792,8 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
         timeout: float | None = None,
         concurrency: int | None = None,
         runtime_resources: dict[str, Any] | None = None,
-        execution_environments: "list[ExecutionEnvironmentRequirement] | None" = None,
+        workspace: Any = None,
+        execution_resources: "list[ExecutionResourceRequirement] | None" = None,
         run_context: "RunContext | None" = None,
         parent_run_context: "RunContext | None" = None,
         auto_close: bool = True,
@@ -663,7 +821,8 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
             timeout=effective_auto_close_timeout,
             concurrency=concurrency,
             runtime_resources=runtime_resources,
-            execution_environments=execution_environments,
+            workspace=workspace,
+            execution_resources=execution_resources,
             run_context=run_context,
             parent_run_context=parent_run_context,
             auto_close=auto_close,
@@ -681,12 +840,14 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
         timeout: float | None = 10.0,
         concurrency: int | None = None,
         runtime_resources: dict[str, Any] | None = None,
+        workspace: Any = None,
         run_context: "RunContext | None" = None,
         parent_run_context: "RunContext | None" = None,
     ) -> AsyncGenerator[StreamT | TriggerFlowInterruptEvent | TriggerFlowInterventionEvent, None]:
         execution = self.create_execution(
             concurrency=concurrency,
             runtime_resources=runtime_resources,
+            workspace=workspace,
             run_context=run_context,
             parent_run_context=parent_run_context,
             auto_close_timeout=0.0,
@@ -704,12 +865,14 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
         timeout: float | None = 10.0,
         concurrency: int | None = None,
         runtime_resources: dict[str, Any] | None = None,
+        workspace: Any = None,
         run_context: "RunContext | None" = None,
         parent_run_context: "RunContext | None" = None,
     ) -> Generator[StreamT | TriggerFlowInterruptEvent | TriggerFlowInterventionEvent, None, None]:
         execution = self.create_execution(
             concurrency=concurrency,
             runtime_resources=runtime_resources,
+            workspace=workspace,
             run_context=run_context,
             parent_run_context=parent_run_context,
             auto_close_timeout=0.0,
@@ -725,7 +888,7 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
 
     def load_blueprint(self, new_blueprint: TriggerFlowBlueprint):
         self._blue_print = new_blueprint
-        self._contract = TriggerFlowContract[InputT, StreamT, ResultT]()
+        self._sync_contract_from_blueprint()
         self.register_chunk_handler = self._blue_print.register_chunk_handler
         self.register_condition_handler = self._blue_print.register_condition_handler
         self._bind_start_process()
@@ -765,7 +928,7 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
         replace: bool = True,
     ):
         self._blue_print.load_flow_config(config, replace=replace)
-        self._contract = TriggerFlowContract[InputT, StreamT, ResultT]()
+        self._sync_contract_from_blueprint()
         self.name = self._blue_print.name
         self._bind_start_process()
         return self
@@ -782,7 +945,7 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
             replace=replace,
             encoding=encoding,
         )
-        self._contract = TriggerFlowContract[InputT, StreamT, ResultT]()
+        self._sync_contract_from_blueprint()
         self.name = self._blue_print.name
         self._bind_start_process()
         return self
@@ -799,7 +962,7 @@ class TriggerFlow(Generic[InputT, StreamT, ResultT]):
             replace=replace,
             encoding=encoding,
         )
-        self._contract = TriggerFlowContract[InputT, StreamT, ResultT]()
+        self._sync_contract_from_blueprint()
         self.name = self._blue_print.name
         self._bind_start_process()
         return self

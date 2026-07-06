@@ -12,17 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Protocol, AsyncGenerator, TYPE_CHECKING
+from typing import Any, Protocol, AsyncGenerator, TYPE_CHECKING, TypeAlias
 from .base import AgentlyPlugin
 
 from agently.types.data import AttemptHandlers
 
 ModelRequestHandlers = AttemptHandlers
+ModelProviderResponseGenerator: TypeAlias = AsyncGenerator[Any, None]
 
 if TYPE_CHECKING:
     from agently.core import Prompt
     from agently.utils import Settings
-    from agently.types.data import AgentlyResponseGenerator, AgentlyRequestData
+    from agently.types.data import AgentlyResultGenerator, AgentlyRequestData
 
 
 class ModelRequester(AgentlyPlugin, Protocol):
@@ -45,6 +46,10 @@ class ModelRequester(AgentlyPlugin, Protocol):
     - `request_model`: Send the model request and return an async generator for streaming responses.
     - `broadcast_response`: Process and broadcast the response stream in a standardized format.
     - `build_request_handlers` (optional): Return typed attempt handlers for core-owned request execution.
+
+    Handler-driven requesters must pass the core-owned `("status", payload)`
+    attempt records through `broadcast_response` unchanged. They are framework
+    stream records, not provider wire messages and not model output fields.
 
     Recommended usage:
     - Plugin developers can inherit from this protocol to implement custom model request logic.
@@ -85,7 +90,7 @@ class ModelRequester(AgentlyPlugin, Protocol):
         """
         ...
 
-    def request_model(self, request_data: "AgentlyRequestData") -> AsyncGenerator[tuple[str, Any], None]:
+    def request_model(self, request_data: "AgentlyRequestData") -> ModelProviderResponseGenerator:
         """
         Send the model request and return an async generator for streaming responses.
 
@@ -93,11 +98,11 @@ class ModelRequester(AgentlyPlugin, Protocol):
             request_data (SerializableData): The generated request data.
 
         Returns:
-            AsyncGenerator: The model response stream, format depends on implementation.
+            AsyncGenerator: Provider-native model response stream, format depends on implementation.
         """
         ...
 
-    def broadcast_response(self, response_generator: AsyncGenerator) -> "AgentlyResponseGenerator":
+    def broadcast_response(self, response_generator: ModelProviderResponseGenerator) -> "AgentlyResultGenerator":
         """
         Process and broadcast the model response stream in a standardized format.
 
@@ -105,7 +110,7 @@ class ModelRequester(AgentlyPlugin, Protocol):
             response_generator (AsyncGenerator): The model response stream.
 
         Returns:
-            AsyncGenerator[AgentlyModelResponseMessage, None]: Standardized response message stream.
+            AsyncGenerator[AgentlyModelResultMessage, None]: Standardized response message stream.
         """
         ...
 

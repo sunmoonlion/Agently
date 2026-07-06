@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import time
 
 import pytest
@@ -279,6 +280,60 @@ async def test_task_dag_executor_runs_roots_concurrently_and_joins_dependencies(
 
 
 @pytest.mark.asyncio
+async def test_task_dag_node_retry_recovers_from_transient_failure():
+    """ISSUE-018: on_error='retry' retries a node and recovers."""
+    attempts = {"n": 0}
+
+    async def flaky_task(context):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise RuntimeError("transient failure")
+        return f"ok-after-{ attempts['n'] }"
+
+    graph = {
+        "graph_id": "retry-recover",
+        "tasks": [
+            {
+                "id": "flaky",
+                "kind": "local",
+                "fallback": {"on_error": "retry", "max_attempts": 3, "backoff_base": 0.001},
+            }
+        ],
+        "semantic_outputs": {"final": "flaky"},
+    }
+
+    snapshot = await TaskDAGExecutor({"local": flaky_task}).async_run(graph, timeout=2)
+    assert snapshot["task_results"]["flaky"] == "ok-after-3"
+    assert attempts["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_task_dag_node_retry_exhausted_then_skip():
+    """ISSUE-018: retries exhausted apply the terminal action (then='skip')."""
+    attempts = {"n": 0}
+
+    async def always_fail(context):
+        attempts["n"] += 1
+        raise RuntimeError("permanent failure")
+
+    graph = {
+        "graph_id": "retry-skip",
+        "tasks": [
+            {
+                "id": "broken",
+                "kind": "local",
+                "fallback": {"on_error": "retry", "max_attempts": 2, "backoff_base": 0.001, "then": "skip"},
+            }
+        ],
+        "semantic_outputs": {"final": "broken"},
+    }
+
+    snapshot = await TaskDAGExecutor({"local": always_fail}).async_run(graph, timeout=2)
+    assert attempts["n"] == 2
+    assert snapshot["task_results"]["broken"]["status"] == "skipped"
+
+
+@pytest.mark.asyncio
 async def test_task_dag_executor_preserves_artifact_refs():
     async def artifact_task(context):
         return {
@@ -303,6 +358,60 @@ async def test_task_dag_executor_preserves_artifact_refs():
     assert snapshot["semantic_outputs"]["report"]["artifact_refs"] == [
         {"kind": "file", "path": "reports/summary.md"}
     ]
+
+
+@pytest.mark.asyncio
+async def test_task_dag_runtime_events_project_recovery_facts(tmp_path):
+    workspace = Agently.create_workspace(tmp_path / "task-dag-runtime-events")
+
+    async def artifact_task(context):
+        return {
+            "summary": "created",
+            "artifact_refs": [{"kind": "file", "path": "reports/summary.md"}],
+        }
+
+    async def local_task(context):
+        return f"ready:{ context.dependency_results['make_report']['summary'] }"
+
+    graph = {
+        "graph_id": "runtime-facts-demo",
+        "tasks": [
+            {"id": "make_report", "kind": "artifact", "produces": [{"role": "report"}]},
+            {"id": "publish_report", "kind": "local", "depends_on": ["make_report"]},
+        ],
+    }
+    compiled = TaskDAGExecutor({"artifact": artifact_task, "local": local_task}).compile(graph)
+    execution = compiled.create_execution(auto_close=False, runtime_resources={"workspace": workspace})
+
+    await execution.async_start({"doc": "policy"})
+    await execution.async_close(timeout=1)
+    runtime_events = await workspace.query_runtime_events(execution.id)
+    dag_node_events = [
+        event
+        for event in runtime_events
+        if event["event_type"] == "triggerflow.task_dag_node"
+    ]
+
+    assert dag_node_events
+    make_report_complete = next(
+        event
+        for event in dag_node_events
+        if event["event"]["payload"]["task_id"] == "make_report"
+        and event["event"]["payload"]["node_result_status"] == "complete"
+    )
+    publish_start = next(
+        event
+        for event in dag_node_events
+        if event["event"]["payload"]["task_id"] == "publish_report"
+        and event["event"]["payload"]["node_result_status"] == "start"
+    )
+    assert make_report_complete["event"]["payload"]["graph_id"] == "runtime-facts-demo"
+    assert make_report_complete["event"]["payload"]["graph_fingerprint"]
+    assert make_report_complete["event"]["payload"]["artifact_refs"] == [
+        {"kind": "file", "path": "reports/summary.md"}
+    ]
+    assert publish_start["event"]["payload"]["dependency_task_ids"] == ["make_report"]
+    assert publish_start["event"]["payload"]["dependency_signal_ids"]
 
 
 @pytest.mark.asyncio
@@ -334,6 +443,124 @@ async def test_task_dag_executor_approval_task_resumes_to_downstream_tasks():
         interrupt_id = next(iter(interrupts))
         await execution.async_continue_with(interrupt_id, {"approved": True})
         snapshot = await execution.async_close(timeout=1)
+    finally:
+        Agently.configure_policy_approval(handler="input_timeout_fail")
+
+    assert snapshot["task_results"]["approve_write"] == {"approved": True}
+    assert snapshot["task_results"]["write_report"] == "approved=True"
+
+
+@pytest.mark.asyncio
+async def test_task_dag_executor_checkpoint_loads_approval_dag_and_continues_downstream():
+    async def consume_approval(context):
+        return f"approved={ context.dependency_results['approve_write']['approved'] }"
+
+    graph = {
+        "graph_id": "approval-checkpoint-demo",
+        "tasks": [
+            {"id": "approve_write", "kind": "approval", "approval": {"type": "human_approval"}},
+            {"id": "write_report", "kind": "local", "depends_on": ["approve_write"]},
+        ],
+    }
+
+    compiled = TaskDAGExecutor({"local": consume_approval}).compile(graph)
+    execution = compiled.create_execution(auto_close=False)
+    Agently.configure_policy_approval(handler="fail_closed")
+    try:
+        await execution.async_start({"request": "publish"})
+
+        interrupts = {}
+        for _ in range(20):
+            interrupts = execution.get_pending_interrupts()
+            if interrupts:
+                break
+            await asyncio.sleep(0.01)
+        assert len(interrupts) == 1
+        saved_state = execution.save()
+        tampered_state = copy.deepcopy(saved_state)
+        tampered_state["runtime_data"]["task_dag"]["tasks"].append(
+            {"id": "tampered", "kind": "local", "depends_on": []}
+        )
+        tampered_report = compiled.create_execution(auto_close=False).inspect_load(tampered_state)
+        assert tampered_report["ready"] is False
+        assert tampered_report["status"] == "invalid_snapshot"
+        assert "triggerflow.task_dag.graph_fingerprint_mismatch" in {
+            diagnostic["code"] for diagnostic in tampered_report["diagnostics"]
+        }
+        await execution.async_close(pending_interrupts="cancel")
+
+        restored = compiled.create_execution(auto_close=False)
+        report = restored.inspect_load(saved_state)
+        assert report["ready"] is True
+        assert report["status"] == "ready"
+        await restored.async_load(saved_state)
+
+        interrupt_id = next(iter(restored.get_pending_interrupts()))
+        await restored.async_continue_with(
+            interrupt_id,
+            {"approved": True},
+            resume_request_id="approval-callback-1",
+        )
+        snapshot = await restored.async_close(timeout=1)
+    finally:
+        Agently.configure_policy_approval(handler="input_timeout_fail")
+
+    assert snapshot["task_results"]["approve_write"] == {"approved": True}
+    assert snapshot["task_results"]["write_report"] == "approved=True"
+
+
+@pytest.mark.asyncio
+async def test_dynamic_task_compiled_dag_loads_approval_dag_and_continues_downstream():
+    async def consume_approval(context):
+        return f"approved={ context.dependency_results['approve_write']['approved'] }"
+
+    graph = {
+        "graph_id": "dynamic-approval-checkpoint-demo",
+        "tasks": [
+            {"id": "approve_write", "kind": "approval", "approval": {"type": "human_approval"}},
+            {
+                "id": "write_report",
+                "kind": "local",
+                "binding": "consume_handler",
+                "depends_on": ["approve_write"],
+            },
+        ],
+    }
+
+    task = Agently.create_dynamic_task(
+        target="publish after approval",
+        plan=graph,
+        handlers={"consume_handler": consume_approval},
+    )
+    compiled = task.compile()
+    execution = compiled.create_execution(auto_close=False)
+    Agently.configure_policy_approval(handler="fail_closed")
+    try:
+        await execution.async_start({"request": "publish"})
+
+        interrupts = {}
+        for _ in range(20):
+            interrupts = execution.get_pending_interrupts()
+            if interrupts:
+                break
+            await asyncio.sleep(0.01)
+        assert len(interrupts) == 1
+        saved_state = execution.save()
+        await execution.async_close(pending_interrupts="cancel")
+
+        restored = compiled.create_execution(auto_close=False)
+        report = restored.inspect_load(saved_state)
+        assert report["ready"] is True
+        assert report["status"] == "ready"
+        await restored.async_load(saved_state)
+
+        interrupt_id = next(iter(restored.get_pending_interrupts()))
+        await restored.async_continue_with(
+            interrupt_id,
+            {"approved": True},
+            resume_request_id="dynamic-approval-callback-1",
+        )
+        snapshot = await restored.async_close(timeout=1)
     finally:
         Agently.configure_policy_approval(handler="input_timeout_fail")
 
@@ -519,7 +746,7 @@ async def test_dynamic_task_default_structured_contract_overrides_planner_flat_m
 def test_agent_create_dynamic_task_consumes_prompt_snapshot_for_target_and_output_contract():
     agent = Agently.create_agent("dynamic-task-prompt-agent")
     agent.set_agent_prompt("info", {"customer": "Acme"})
-    agent.set_request_prompt("instruct", "Focus on renewal risk.")
+    agent.set_execution_prompt("instruct", "Focus on renewal risk.")
     task = (
         agent
         .input({"account": "Acme", "ticket": "T-42"})

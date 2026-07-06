@@ -30,9 +30,9 @@ Action 是 Agently 的请求期能力层：模型在回答一次请求时，可�
 - `ActionRuntime`：`AgentlyActionRuntime`
 - `ActionFlow`：`TriggerFlowActionFlow`
 - `ActionExecutor`：本地函数、MCP、Search/Browse、Python/Bash 沙箱、Node.js、SQLite、Docker
-- `ExecutionEnvironmentProvider`：MCP、Python、Bash、Node.js、Docker、Browser、SQLite
+- `ExecutionResourceProvider`：MCP、Python、Bash、Node.js、Docker、Browser、SQLite
 
-公共 facade（外观入口）在 [`agently/core/Action/`](../../../agently/core/Action/)。Agent 级挂载入口在 [`agently/builtins/agent_extensions/ActionExtension.py`](../../../agently/builtins/agent_extensions/ActionExtension.py)。可运行示例按场景列在 [`examples/action_runtime/README.md`](../../../examples/action_runtime/README.md)，真实模型驱动的 cookbook 模式示例在 [`examples/cookbook/`](../../../examples/cookbook/)。
+公共 facade（外观入口）在 [`agently/core/operation/Action/`](../../../agently/core/operation/Action/)。Agent 级挂载入口在 [`agently/builtins/agent_extensions/ActionExtension.py`](../../../agently/builtins/agent_extensions/ActionExtension.py)。可运行示例按场景列在 [`examples/action_runtime/README.md`](../../../examples/action_runtime/README.md)，真实模型驱动的 cookbook 模式示例在 [`examples/cookbook/`](../../../examples/cookbook/)。
 
 ## 怎么读
 
@@ -40,7 +40,7 @@ Action 是 Agently 的请求期能力层：模型在回答一次请求时，可�
 |---|---|
 | 写新的函数 action | [Action Runtime](action-runtime.md) |
 | 给业务 agent 开放 Python、shell 或 workspace 能力 | [Action Runtime](action-runtime.md) |
-| 开发需要托管资源的后端 | [Execution Environment](execution-environment.md) |
+| 开发需要托管资源的后端 | [ExecutionResource](execution-environment.md) |
 | 旧代码还在用 `tool_func` | [工具兼容](tools.md) |
 | 使用本地或 HTTP MCP server | [MCP](mcp.md) |
 | 让多个 action 跨步骤协作 | [TriggerFlow 模式](../triggerflow/patterns.md) |
@@ -51,4 +51,4 @@ Action 是 Agently 的请求期能力层：模型在回答一次请求时，可�
 `ToolManager` 插件类型仍保留给旧代码使用，但新的 examples 走 Action Runtime。
 `examples/action_runtime/` 里的示例会先创建 request-scoped `turn`，用
 `agent.get_action_result(prompt=turn.prompt)` 查看中间 `ActionResult`，再调用
-`turn.get_response()`，并读取 `extra.action_logs`。
+`turn.get_result()`，并读取 `extra.action_logs`。

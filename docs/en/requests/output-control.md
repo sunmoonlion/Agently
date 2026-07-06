@@ -10,7 +10,7 @@ keywords: Agently, output, validate, ensure_keys, retry, max_retries
 
 The validation pipeline runs the first time a structured response result is consumed, then caches the outcome on that response result. It has a fixed order, and each step contributes to the same retry budget.
 
-For Agently `4.1.0.1+`, the default authoring path is: mark fixed required leaves directly in `.output(...)` with the third-slot `ensure` flag, then let the runtime compile those flags into `ensure_keys`. Pass `ensure_keys=` manually only when the required path is runtime-dependent, conditional, or easier to express outside the static schema. Required string leaves must contain non-blank text; a missing key, `None`, blank string, empty wildcard result, or wildcard result containing a blank required value triggers the shared retry flow. `False` and `0` remain valid required values.
+For Agently `4.1.0.1+`, the default authoring path is: mark fixed required leaves directly in `.output(...)` with the third-slot `ensure` flag, then let the runtime compile those flags into `ensure_keys`. Pass `ensure_keys=` manually only when the required path is runtime-dependent, conditional, or easier to express outside the static schema. By default, tuple `True` and runtime `ensure_keys` check path/key presence only; the value may be `None`, a blank string, `False`, `0`, an empty list, or another intentionally empty value. Use the explicit tuple marker `"not_null"` when a required path must also contain a meaningful value; it rejects `None`, blank strings, empty lists or wildcard matches, and lists containing missing required values while still accepting `False` and `0`.
 
 ## Choosing An Output Format
 
@@ -36,15 +36,16 @@ explicitly. `yaml_literal` is explicit opt-in and is not selected by auto.
 | `xml_field` | Explicit format, or auto target, for flat string-only dict schemas. Agently parses this with a custom XML-like parser, not strict XML. | A downstream consumer expects real XML semantics, namespaces, entity escaping, or schema validation. |
 | `yaml_literal` | Explicit opt-in for teams that prefer YAML documents and can tolerate YAML indentation sensitivity. Long text/code fields use YAML literal scalars (`|`) inside `<<<BEGIN AGENTLY_YAML>>>` / `<<<END AGENTLY_YAML>>>` boundaries. | General auto mode, low-adherence models, or dense machine contracts where JSON is simpler and less indentation-sensitive. |
 | `json` | You need the strictest machine contract, nested data, arrays, interop with external systems, compatibility with old prompts/tests, or exact raw JSON behavior. | Large embedded documents or code blocks make escaping fragile or hard for the model to read. |
-| Plain text | The request asks for one freeform artifact: an article, email, explanation, report, Markdown page, HTML page, or other single multi-paragraph document. Do not call `output()`; use `start()` / `async_start()` directly or read `response.result.get_text()`. | You need separately addressable fields, path validation, `ensure_keys`, typed objects, or downstream branching. |
+| Plain text | The request asks for one freeform artifact: an article, email, explanation, report, Markdown page, HTML page, or other single multi-paragraph document. Do not call `output()`; use `start()` / `async_start()` directly or read `result.get_text()`. | You need separately addressable fields, path validation, `ensure_keys`, typed objects, or downstream branching. |
 
 ### Instant Streaming
 
 Use `get_generator(type="instant")` or `get_async_generator(type="instant")`
 when the caller benefits from field-level structured updates before the full
-response is finished: progress panels, live forms, long reports with
-independently renderable sections, model-stage dashboards, or workflow UIs that
-can route one field while the rest of the response is still generating. For one
+response is finished: progress panels, live forms, long, sectioned, or
+file-backed deliverables with independently renderable sections,
+model-stage dashboards, or workflow UIs that can route one field while the rest
+of the response is still generating. For one
 freeform text artifact, use `type="delta"` instead; plain text has no structured
 field paths for instant events.
 
@@ -69,7 +70,7 @@ request.
 | `xml_field` | Yes, field-level text deltas inside `<field name="..." type="...">` blocks. | Useful when explicit boundaries are easier for the target model than Markdown section headers. Final parsing consumes the normalized answer payload, not provider reasoning. |
 | `yaml_literal` | Yes, top-level field deltas inside the target YAML boundary. | Treat as provisional UI state. Final YAML parsing is indentation-sensitive and should be checked through `get_data()`. |
 | `json` | Yes, via incremental JSON parsing. | Best when arrays or nested objects need path-level updates. More sensitive to malformed or delayed JSON syntax while streaming; final repair still happens at completion. |
-| Plain text / `text` | No structured instant paths. | Use `type="delta"` for raw token streaming, or `get_text()` after completion. |
+| Plain text / `text` | No structured instant paths. | Use `type="delta"` for text-increment streaming, or `get_text()` after completion. Use `original` / `original_delta` views only when debugging provider-level raw events. |
 
 ### Current Format Contracts
 
@@ -89,7 +90,7 @@ for model-owned content.
 | `xml_field` | Uses one `<agently_output>` payload with `<field name="..." type="text|json">` blocks. The parser is XML-like and boundary-based, not strict XML. Explicit `format="xml_field"` or auto can select it for flat string-only dict schemas. |
 | `yaml_literal` | Uses a target YAML boundary and literal scalars for long text. It is explicit opt-in and remains outside auto by default. |
 | reasoning text | Provider-native reasoning and leading outer `<think>...</think>` content before the payload are normalized to reasoning events before parsing. Payload/code/text-internal `<think>` content is preserved. |
-| tuple `ensure` | Third-slot `True` compiles to `ensure_keys`. The path must resolve to a meaningful value: non-blank string for string leaves, non-empty values for wildcard matches, and ordinary typed values such as `False` or `0` remain valid. |
+| tuple `ensure` | Third-slot `True` compiles to `ensure_keys` and checks path/key presence. Third-slot `"not_null"` opts into strict value presence: `None`, blank strings, empty lists or wildcard matches, and lists containing missing required values retry; `False` and `0` remain valid. |
 
 Typical usage:
 
@@ -134,7 +135,7 @@ html = agent.input("Write a complete landing page as HTML.").start()
 Progressive UI example:
 
 ```python
-response = (
+result = (
     agent
     .input("Turn this incident note into a customer-safe update: ...")
     .output(
@@ -145,12 +146,12 @@ response = (
         },
         format="json",
     )
-    .get_response()
+    .get_result()
 )
 
 ui_state = {}
 
-async for item in response.get_async_generator(type="instant"):
+async for item in result.get_async_generator(type="instant"):
     if item.delta:
         ui_state[item.path] = ui_state.get(item.path, "") + item.delta
         await websocket.send_json({
@@ -159,7 +160,7 @@ async for item in response.get_async_generator(type="instant"):
             "done": item.is_complete,
         })
 
-final = await response.async_get_data()
+final = await result.async_get_data()
 await save_case_update(final)
 ```
 
@@ -308,7 +309,7 @@ Two caveats:
 
 ## Single execution per response
 
-Validation runs **once** per `ModelResponseResult` and the outcome is cached. Repeated calls — `get_data()` then `get_data()` again, or `get_data()` then `get_data_object()` — do **not** rerun validators. If you try to inject a different handler on the same response after validation has already finalized, the new handler is ignored with a warning.
+Validation runs **once** per `ModelRequestResult` and the outcome is cached. Repeated calls — `get_data()` then `get_data()` again, or `get_data()` then `get_data_object()` — do **not** rerun validators. If you try to inject a different handler on the same result after validation has already finalized, the new handler is ignored with a warning.
 
 This means: don't expect to swap validators per consumer. If you need different validation for different consumers, run the request twice.
 
@@ -332,9 +333,10 @@ Agently-DevTools consumes these defensively. New event keys are additive and sho
 `ensure_keys` and `.validate(...)` are layered:
 
 - `ensure_keys` handles **path presence** (compiled from the `ensure` flag in `.output(...)`).
+- tuple `"not_null"` handles the common built-in **value presence** rule when empty values should retry.
 - `.validate(...)` handles **value rules** that depend on the actual content.
 
-For fixed required leaves, prefer `(TypeExpr, "description", True)` in `.output(...)` rather than manually repeating the same paths in `ensure_keys=`. Use manual `ensure_keys` for conditional or runtime-only paths. Use `.validate(...)` for "this field must satisfy this business rule".
+For fixed required leaves, prefer `(TypeExpr, "description", True)` in `.output(...)` rather than manually repeating the same paths in `ensure_keys=`. Use `(TypeExpr, "description", "not_null")` only when empty values are invalid for that field. Use manual `ensure_keys` for conditional or runtime-only paths. Use `.validate(...)` for "this field must satisfy this business rule".
 
 ## Common patterns
 

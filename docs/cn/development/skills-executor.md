@@ -118,14 +118,18 @@ plan = await agent.async_resolve_skills_plan(
 
 ## 执行
 
-当任务必须通过 selected Skills 回答时，用 `run_skills_task(...)`。默认执行策略是
-`single_shot`：Agently 会把 selected Skills 的 `SKILL.md` guidance、
-decision cards、资源摘要和任务放进一次模型请求。多步策略由宿主侧执行选项
-选择，例如 `effort="react"` 或 route options；Skill 不能通过 Agently 私有
-frontmatter 声明执行策略。
+当任务必须通过 selected Skills 回答时，用 `run_skills_task(...)`。它是 Blocks
+生命周期上的兼容 facade：内部会构造包含 `skill_activation` PlanBlock 和具体策略
+PlanBlock 的 ExecutionPlan，再降低为 TriggerFlow-backed ExecutionBlockGraph。默认
+`single_shot` route label 会降低为 `model_request` block；`runtime_chain`、`staged`
+和 `react` 等多步 label 会降低为可信 `flow_segment` block。Skill 不能通过
+Agently 私有 frontmatter 声明执行策略。
+
 当可用 action 存在时，`react` 会把 tool/action 规划和执行委托给 Agent
 ActionRuntime，因此 kwargs schema、MCP tools、policy、approval、concurrency 和
-Execution Environment 处理仍由 Action 层拥有，而不是由 Skills 重新实现。
+ExecutionResource 处理仍由 Action 层拥有，而不是由 Skills 重新实现。Skill
+activation evidence 只证明 guidance 和资源上下文已加载；side-effect evidence
+必须来自下游 Actions、Workspace operations、waits 或其他具体 execution blocks。
 
 ```python
 execution = await agent.async_run_skills_task(
@@ -137,6 +141,7 @@ execution = await agent.async_run_skills_task(
 print(execution.status)
 print(execution.output)
 print(execution.skill_logs)
+print(execution.close_snapshot["blocks"]["evidence"])
 ```
 
 `output=` 使用和 `.output(...)` 相同的 schema grammar；它就是本次
@@ -168,9 +173,9 @@ execution = await (
 )
 ```
 
-`set_agent_prompt(...)` 写入的长期 prompt 会被继承并保留给后续轮次；
-`set_turn_prompt(...)`、兼容别名 `set_request_prompt(...)` 和 quick prompt 写入的
-本轮 turn prompt 会被冻结到这次 Skill run，然后从 pending request 清理。显式传入的 `output=` 和
+`set_agent_prompt(...)` 写入的长期 prompt 会被继承并保留给后续 execution；
+quick prompt 写入的本轮 execution prompt 会被冻结到这次 Skill run，然后从
+pending execution prompt 清理。显式传入的 `output=` 和
 `output_format=` 参数优先于 prompt 推导值。
 
 `output_format=` 用于选择这次模型响应的输出控制方式。普通 Skill 回答保持默认
@@ -222,13 +227,29 @@ judge。
 - `skills.prompt_only.done`
 - `effort="normal"` 或 `effort="max"` 选中内置 planner chain 时，会收到
   `skills.runtime_chain.*`
-- 选中多步策略时，还会收到 `skills.staged.*`、`skills.react.*` 和 `block.*`
-  事件
+- 选中多步兼容 label 时，还会收到 `skills.staged.*` 和 `skills.react.*`
+- 内置 `staged` 或 `react` 策略因 step budget 耗尽而停止或截断工作时，会收到
+  `skills.execution.budget_exhausted`
+- host cancellation 传入 Skills runtime，或框架执行在正常 Skills result
+  返回前失败时，会收到 `skills.execution.aborted`
 
-`effort="fast"` 使用低开销 single-shot 路径。`effort="normal"` 固定走完整
+Blocks lowering evidence、ExecutionBlockGraph、ResultAdapter output 和
+TriggerFlow close snapshot 可从 `execution.close_snapshot["blocks"]` 读取。
+Abort diagnostics 会包含 strategy、effort、elapsed seconds，以及可用时的最后一个
+active runtime event。Wall-clock 和 no-progress 限制仍属于 host policy；Skills
+只在 runtime 观察到取消或失败后记录诊断。
+
+直接 Skills `stream_handler` 回调可用 `agently.types.data` 里的
+`SkillRuntimeStreamHandler` 标注。如果你在自定义 Skills effort strategy 里调用
+`context.async_request_model(..., stream_handler=...)`，这个模型流回调收到的是
+`StreamingData`，可用 `ModelStreamingHandler` 标注。两个类型都可以从根入口导入：
+`from agently import StreamingData, ModelStreamingHandler`。
+
+`effort="fast"` 使用低开销 single-shot 兼容 label。`effort="normal"` 固定走完整
 preflight -> research -> plan -> execute -> verify -> reflect -> finalize
-链路。`effort="max"` 使用同一链路，但提高 retry 预算，并作为后续 Dynamic Task
-升级的挂接点。
+兼容链路。`effort="max"` 使用同一链路，但提高 retry 预算，并作为后续 Dynamic Task
+升级的挂接点。每个 label 都会在 close snapshot 中留下 Blocks plan/evidence
+metadata。
 
 需要覆盖内置档位时，可以用 `agent.set_settings("effort_presets", {...})` 把调用方
 看到的质量/成本档位映射到策略、model key、step budget、retry count 和 artifact
@@ -280,12 +301,13 @@ def handler(
 ) -> Awaitable[Any] | Any: ...
 ```
 
-内置 handler 也注册在同一张 strategy 表里：`single_shot`、`runtime_chain`、
-`staged` 和 `react`。可以用
+内置兼容 route label 也注册在同一张 strategy 表里：`single_shot`、
+`runtime_chain`、`staged` 和 `react`。可以用
 `Agently.skills_executor.list_effort_strategies()` 查看当前可用策略名。自定义
 handler 只有显式传入 `replace=True` 时才能替换内置策略；否则重名会 fail closed。
 内置参考实现位于
-`agently/builtins/plugins/SkillsExecutor/AgentlySkillsExecutor/modules/effort_strategies/`。
+`agently/builtins/plugins/SkillsExecutor/AgentlySkillsExecutor/modules/effort_strategies/`，
+并作为可信 Blocks runtime handler 被调用，不是另一套 Skills-owned lifecycle。
 
 ```python
 async def audit_plus_strategy(*, context, task, plan, effort_config, **_):
@@ -329,6 +351,56 @@ Skills runtime 内部模型调用使用符号阶段 key：`planner`、`research`
 通过 Agent 自动编排选中 Skills route 时，模型字段流会桥接到稳定路径，例如
 `skills.model.fields.<field_path>`。
 
+## 面向 DAG 消费者的 Context Pack
+
+当自定义 planner、Dynamic Task 或 TaskDAG node 需要完整 Skill 上下文，但不需要强制
+进入完整 Skills execution route 时，可以构建 context pack。Context pack 会在
+`agently.skills.context_pack.v1` schema 下提供已选 Skill 的 `SKILL.md` 指导、
+和任务相关的 references、examples、可选 assets、resource index metadata、citations、
+diagnostics，以及受宿主 policy 控制的 action candidates。
+
+```python
+pack = await agent.async_build_skills_context_pack(
+    "Generate DeepSeek provider setup code.",
+    skills=["model-setup"],
+    intent="generate_code",
+    include_examples="auto",
+    include_references="auto",
+    budget_chars=12000,
+)
+```
+
+DAG-shaped execution 应复用 Skills Executor 的 resolver adapter，不需要创建新的
+scheduler：
+
+```python
+from agently.core import TaskDAGExecutor
+
+snapshot = await TaskDAGExecutor(
+    Agently.skills_executor.task_dag_resolver()
+).async_run({
+    "graph_id": "skill-context-demo",
+    "task_schema_version": "task_dag/v1",
+    "tasks": [
+        {
+            "id": "skill_context",
+            "kind": "skill",
+            "inputs": {
+                "task": "Generate provider setup code.",
+                "skill_ids": ["model-setup"],
+                "intent": "generate_code",
+            },
+        }
+    ],
+    "semantic_outputs": {"context": "skill_context"},
+})
+```
+
+`include_public_lookup=True` 和 `actionize_scripts=True` 仍然是显式开启的宿主
+policy 操作。公开检索需要 `web_search: "allow"`。脚本 Action 化需要
+`script_run: "allow"` 或通过 PolicyApproval；它只挂载 allowlisted shell Action
+candidate，不会执行脚本。
+
 安装 Skill 不会自动执行 bundled scripts 或资源。标准 Skill 如果在正文、资源、
 `compatibility` 或公开 `metadata` 里表达了 search、browse、HTTP、Workspace file、
 Python、shell/script 或 MCP 需求，Skills Executor 会在 plan 里记录结构化
@@ -349,15 +421,31 @@ agent.configure_skill_capabilities(
     workspace_root="./.agently/tasks/research",
     search={
         "backend": "auto",
-        "refresh_ddgs": "allow",
     },
+    # 每次 Skills 执行后回收一次性挂载的能力，而不是把它们留在 agent 上。
+    # 默认 "agent" 保留挂载以便复用。
+    capability_scope="execution",
+    # 仅自动挂载置信度达到该阈值的能力需求；从 SKILL.md 正文推断的低置信
+    # 需求仅作提示。默认不设阈值。
+    min_auto_mount_confidence=0.8,
+    # 内置 HTTP 能力默认拒绝私网/环回/链路本地目标；需要时显式放行内部主机。
+    http_request={"allow_hosts": ["internal.api.example.com"]},
 )
 agent.configure_policy_approval(handler="input_timeout_fail")
 ```
 
+内置只读 HTTP 能力默认拒绝私网、环回与链路本地主机（SSRF 防护）；如需访问内部
+目标，用 `http_request={"allow_hosts": [...]}` 或 `{"allow_private": true}` 显式放行。
+默认脚本白名单只包含本地解释器（`bash`、`sh`、`python`、`node`），不含会拉取并执行
+任意远端代码的包运行器（`npx`/`npm`）；确有需要时再通过 policy 显式加入。
+
+当 `capability_scope="execution"` 时，SkillsExecutor 只回收本次执行中新挂载的能力。
+如果宿主 Agent 已经存在请求的 action id，SkillsExecutor 会复用该宿主 action，并在
+Skills run 结束后保留它；execution-scoped cleanup 不能覆盖或注销宿主拥有的 actions。
+
 面向搜索的 Skills，Agently 会装载由 `ddgs` Python package 支撑的框架 Search
-能力。真实搜索前建议保持 `ddgs` 最新：
-`python -m pip install --upgrade ddgs`。backend 策略不能被固定成某一个 provider；
+能力。请在宿主环境中预先保持 `ddgs` 最新（`python -m pip install --upgrade ddgs`）；
+Agently 运行时不会改动宿主环境。backend 策略不能被固定成某一个 provider；
 默认使用 `backend="auto"`，也可以由宿主 policy 配置任何 ddgs 支持的 backend。
 Search 会把 backend 层面的“无结果”视为成功空结果，并在选定 backend 没有解析到
 可用结果时继续尝试配置或默认的 ddgs fallback backends。如果一个或多个 backend
@@ -401,8 +489,8 @@ action calls 取得真实天气观测；Skills Executor 在命中后懒安装选
 
 Skill 的适用性来自 `SKILL.md`；Agently 的 `.agently/` 文件只是描述性的安装元数据。
 多步 Skills 执行应组合 Agently 已有的 TriggerFlow、Action 和
-ExecutionEnvironment 边界；人工审批或持久 wait/resume 应通过 TriggerFlow
-`pause_for(...)` / `continue_with(...)`，或 Action / ExecutionEnvironment
+ExecutionResource 边界；人工审批或持久 wait/resume 应通过 TriggerFlow
+`pause_for(...)` / `continue_with(...)`，或 Action / ExecutionResource
 审批策略表达，不应通过修改已关闭的 `SkillExecution` snapshot 来伪装恢复。
 
 框架级 `skills.*` 配置仍可调整宿主行为，例如普通 prompt 是否披露可选 Skill
@@ -424,6 +512,9 @@ Agently.skills_executor.configure(
 - `Agently.skills_executor.install_skills_pack(...)`
 - `Agently.skills_executor.configure(...)`
 - `Agently.skills_executor.inspect_skills(...)`
+- `Agently.skills_executor.build_context_pack(...)`
+- `Agently.skills_executor.task_dag_resolver(...)`
+- `agent.build_skills_context_pack(...)`
 - `agent.use_skills(...)`
 - `agent.use_skills_packs(...)`
 - `agent.resolve_skills_plan(...)`

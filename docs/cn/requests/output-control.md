@@ -10,7 +10,7 @@ keywords: Agently, output, validate, ensure_keys, retry, max_retries
 
 第一次消费结构化 response 结果时，校验流水线会运行并缓存结果。它的执行顺序固定，每一步都共用同一份 retry 预算。
 
-对 Agently `4.1.0.1+`，默认 authoring 路径是：在 `.output(...)` 里直接用第三槽 `ensure` 标记固定必填叶子，再由运行时把这些标记编译成 `ensure_keys`。只有当必填路径是运行时决定、条件分支决定，或用静态 schema 不好表达时，才手动传 `ensure_keys=`。必填字符串叶子必须是非空白文本；缺 key、`None`、空白字符串、空 wildcard 结果，或 wildcard 结果里包含空白必填值，都会进入同一套 retry 流程。`False` 和 `0` 仍然是有效必填值。
+对 Agently `4.1.0.1+`，默认 authoring 路径是：在 `.output(...)` 里直接用第三槽 `ensure` 标记固定必填叶子，再由运行时把这些标记编译成 `ensure_keys`。只有当必填路径是运行时决定、条件分支决定，或用静态 schema 不好表达时，才手动传 `ensure_keys=`。默认情况下，第三槽 `True` 和手动 `ensure_keys` 只检查路径/key 是否出现；值可以是 `None`、空白字符串、`False`、`0`、空列表，或其他业务上合法的空值。若某个必填路径还必须包含可用值，显式写第三槽 `"not_null"`；它会拒绝 `None`、空白字符串、空列表或空 wildcard 匹配，以及列表中包含缺失的必填值，同时仍接受 `False` 和 `0`。
 
 ## 选择输出格式
 
@@ -33,7 +33,7 @@ opt-in 格式，不进入 auto；`flat_markdown` 仅作为显式兼容模式保�
 | `xml_field` | 显式格式，或 auto 目标；适合扁平纯字符串 dict。Agently 用自定义 XML-like parser 解析，不是严格 XML parser；text 字段可包含 Markdown、代码、`&` 或类似 XML 的片段。 | 下游消费者期待真实 XML 语义、namespace、entity escaping 或 XML schema validation。 |
 | `yaml_literal` | 团队明确偏好 YAML document，且可接受 YAML 缩进敏感性时显式使用。长文本/代码字段用 YAML literal scalar（`|`），整体包在 `<<<BEGIN AGENTLY_YAML>>>` / `<<<END AGENTLY_YAML>>>` boundary 中。 | 通用 auto、低遵循模型，或 JSON 更简单稳定的 dense machine contract。 |
 | `json` | 需要最稳定的机器契约、嵌套数据、数组、外部系统互通、兼容旧 prompt/测试，或下游明确依赖原始 JSON 行为。 | 大段嵌入文档或代码会让转义变脆弱，也更难让模型稳定生成。 |
-| 纯文本 | 请求只要一个自由文本成品：文章、邮件、解释、报告、Markdown 页面、HTML 页面，或其他单一多段落文档。不要调用 `output()`；直接用 `start()` / `async_start()`，或读取 `response.result.get_text()`。 | 需要可单独寻址的字段、路径校验、`ensure_keys`、typed object 或下游分支。 |
+| 纯文本 | 请求只要一个自由文本成品：文章、邮件、解释、报告、Markdown 页面、HTML 页面，或其他单一多段落文档。不要调用 `output()`；直接用 `start()` / `async_start()`，或读取 `result.get_text()`。 | 需要可单独寻址的字段、路径校验、`ensure_keys`、typed object 或下游分支。 |
 
 ### Instant Streaming
 
@@ -62,7 +62,7 @@ opt-in 格式，不进入 auto；`flat_markdown` 仅作为显式兼容模式保�
 | `xml_field` | 支持，在 `<field name="..." type="...">` block 内输出字段级 text delta。 | 当显式 boundary 比 Markdown header 更容易被目标模型遵循时使用。最终解析消费归一化后的 answer payload，不消费 provider reasoning。 |
 | `yaml_literal` | 支持，在目标 YAML boundary 内输出顶层字段 delta。 | 作为临时 UI 状态使用。最终 YAML parsing 对缩进敏感，应以 `get_data()` 结果为准。 |
 | `json` | 支持，走增量 JSON parser。 | 适合数组或嵌套对象的路径级更新。流式阶段更依赖模型及时输出合法 JSON 片段；完成后仍会做最终 repair/parse。 |
-| 纯文本 / `text` | 不提供结构化 instant path。 | 用 `type="delta"` 做原始 token 流式，或完成后 `get_text()`。 |
+| 纯文本 / `text` | 不提供结构化 instant path。 | 用 `type="delta"` 做文本增量流式，或完成后 `get_text()`。只有调试 provider 级原始事件时才使用 `original` / `original_delta` 视图。 |
 
 ### 当前格式契约
 
@@ -79,7 +79,7 @@ opt-in 格式，不进入 auto；`flat_markdown` 仅作为显式兼容模式保�
 | `xml_field` | 使用一个 `<agently_output>` payload 和 `<field name="..." type="text|json">` block。parser 是 XML-like boundary parser，不是严格 XML。显式 `format="xml_field"` 或 auto 会将扁平纯字符串 dict 解析到该格式。 |
 | `yaml_literal` | 使用目标 YAML boundary；长文本字段使用 literal scalar。显式 opt-in，默认不进入 auto。 |
 | reasoning 文本 | provider-native reasoning 和目标 payload 前面的完整外层 `<think>...</think>` 会在解析前归一为 reasoning event。payload/code/text 内部的 `<think>` 会保留。 |
-| 元组 `ensure` | 第三槽 `True` 会编译为 `ensure_keys`。对应路径必须解析到可用值：字符串叶子必须非空白，wildcard 匹配结果必须非空且每个必填值可用；`False` 或 `0` 这类 typed 值仍然有效。 |
+| 元组 `ensure` | 第三槽 `True` 会编译为 `ensure_keys`，检查路径/key 是否出现。第三槽 `"not_null"` 显式开启严格值存在校验：`None`、空白字符串、空列表或空 wildcard 匹配，以及列表中包含缺失必填值都会重试；`False` 与 `0` 仍然有效。 |
 
 典型用法：
 
@@ -124,7 +124,7 @@ html = agent.input("Write a complete landing page as HTML.").start()
 渐进式 UI 示例：
 
 ```python
-response = (
+result = (
     agent
     .input("把这条事故记录改写成客户可读状态更新：...")
     .output(
@@ -135,12 +135,12 @@ response = (
         },
         format="json",
     )
-    .get_response()
+    .get_result()
 )
 
 ui_state = {}
 
-async for item in response.get_async_generator(type="instant"):
+async for item in result.get_async_generator(type="instant"):
     if item.delta:
         ui_state[item.path] = ui_state.get(item.path, "") + item.delta
         await websocket.send_json({
@@ -149,7 +149,7 @@ async for item in response.get_async_generator(type="instant"):
             "done": item.is_complete,
         })
 
-final = await response.async_get_data()
+final = await result.async_get_data()
 await save_case_update(final)
 ```
 
@@ -292,7 +292,7 @@ def check(result, ctx):
 
 ## 单 response 单次执行
 
-每个 `ModelResponseResult` 只跑**一次** validation 并缓存结果。多次调用——`get_data()` 再 `get_data()`，或 `get_data()` 后 `get_data_object()`——**不会**重跑 validator。如果 validation 已经定型后再注入新 handler，新 handler 被忽略并发 warning。
+每个 `ModelRequestResult` 只跑**一次** validation 并缓存结果。多次调用——`get_data()` 再 `get_data()`，或 `get_data()` 后 `get_data_object()`——**不会**重跑 validator。如果 validation 已经定型后再往同一个 result 注入新 handler，新 handler 被忽略并发 warning。
 
 含义：不要为不同 consumer 切换 validator。需要不同校验时，发两次请求。
 
@@ -316,9 +316,10 @@ phase 1 **没有** `model.validation_passed` 事件 —— 通过是默认且静
 `ensure_keys` 与 `.validate(...)` 是分层的：
 
 - `ensure_keys` 处理**路径存在性**（由 `.output(...)` 中的 `ensure` 编译而来）。
+- 元组 `"not_null"` 处理常见的内置**值存在性**规则，用于空值也应触发重试的字段。
 - `.validate(...)` 处理基于实际内容的**值规则**。
 
-固定必填叶子优先写 `(TypeExpr, "description", True)`，不要把同一批路径再手动重复到 `ensure_keys=`。条件型或运行时决定的路径，再用手动 `ensure_keys`。而「这字段必须满足某业务规则」用 `.validate(...)`。
+固定必填叶子优先写 `(TypeExpr, "description", True)`，不要把同一批路径再手动重复到 `ensure_keys=`。只有当空值对该字段非法时，才写 `(TypeExpr, "description", "not_null")`。条件型或运行时决定的路径，再用手动 `ensure_keys`。而「这字段必须满足某业务规则」用 `.validate(...)`。
 
 ## 常见模式
 
@@ -349,4 +350,4 @@ def policy_check(result, ctx):
 
 - [Schema as Prompt](schema-as-prompt.md) —— `.output(...)` authoring 与 `ensure` 标记
 - [模型响应](model-response.md) —— 缓存与重跑的实际差别
-- [术语表：ensure](../reference/glossary.md#ensure第三槽)
+- [术语表：ensure](../reference/glossary.md#ensure-third-tuple-slot)

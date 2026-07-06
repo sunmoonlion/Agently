@@ -16,23 +16,30 @@ from __future__ import annotations
 
 import os
 from typing import Any, AsyncGenerator, Literal, TYPE_CHECKING, overload, Generator, Mapping
+from typing_extensions import Self
 
 from agently.core.extension import ExtensionHandlers
 from agently.core.runtime import resolve_parent_run_context
 from agently.utils import Settings, FunctionShifter
 
 from .Prompt import Prompt
+from .ModelRequestRunner import ModelRequestRunner
+from .ModelRequestResult import ModelRequestResult
 from .ModelResponse import ModelResponse
-from .ModelResponseResult import ModelResponseResult
 from .AttachmentInput import ImageDetail, build_image_attachment
 
 if TYPE_CHECKING:
+    from pydantic import BaseModel
+
     from agently.core import PluginManager
     from agently.types.data import (
         InstantStreamingContentType,
+        AgentlyModelResultMessage,
+        AgentlyOriginalResultPayload,
+        AgentlySpecificResultMessage,
         OutputValidateHandler,
         PromptStandardSlot,
-        ResponseContentType,
+        ResultContentType,
         RunContext,
         SpecificEvents,
         StreamingData,
@@ -91,7 +98,7 @@ class ModelRequest:
         parent_prompt: Prompt | None = None,
         parent_extension_handlers: ExtensionHandlers | None = None,
         model_key: str | None = None,
-    ):
+    ) -> None:
         self.agent_name = agent_name if agent_name is not None else "Directly Request"
         self.agent_id = agent_id
         self.plugin_manager = plugin_manager
@@ -121,14 +128,6 @@ class ModelRequest:
         self.set_settings = self.settings.set_settings
         self.load_settings = self.settings.load
 
-        self.get_meta = FunctionShifter.syncify(self.async_get_meta)
-        self.get_text = FunctionShifter.syncify(self.async_get_text)
-        self.get_data = FunctionShifter.syncify(self.async_get_data)
-        self.get_data_object = FunctionShifter.syncify(self.async_get_data_object)
-
-        self.start = self.get_data
-        self.async_start = self.async_get_data
-
     def _create_request_run_context(
         self,
         response_id: str | None = None,
@@ -156,7 +155,7 @@ class ModelRequest:
         value: tuple[type, str | None, str | None] | Any,
         *,
         mappings: dict[str, Any] | None = None,
-    ):
+    ) -> Self:
         self.prompt.set(key, value, mappings=mappings)
         return self
 
@@ -168,7 +167,7 @@ class ModelRequest:
         *,
         mappings: dict[str, Any] | None = None,
         **kwargs: Any,
-    ):
+    ) -> Self:
         prompt, mappings = _resolve_quick_prompt_input(prompt, value, mappings, kwargs)
         self.prompt.set("system", prompt, mappings=mappings)
         return self
@@ -180,7 +179,7 @@ class ModelRequest:
         *,
         mappings: dict[str, Any] | None = None,
         **kwargs: Any,
-    ):
+    ) -> Self:
         prompt, mappings = _resolve_quick_prompt_input(prompt, value, mappings, kwargs)
         self.prompt.set("system", ["{system.rule} ARE IMPORTANT RULES YOU SHALL FOLLOW!"])
         self.prompt.set("system.rule", prompt, mappings=mappings)
@@ -193,7 +192,7 @@ class ModelRequest:
         *,
         mappings: dict[str, Any] | None = None,
         **kwargs: Any,
-    ):
+    ) -> Self:
         prompt, mappings = _resolve_quick_prompt_input(prompt, value, mappings, kwargs)
         self.prompt.set("system", ["YOU MUST REACT AND RESPOND AS {system.your_role}!"])
         self.prompt.set("system.your_role", prompt, mappings=mappings)
@@ -206,7 +205,7 @@ class ModelRequest:
         *,
         mappings: dict[str, Any] | None = None,
         **kwargs: Any,
-    ):
+    ) -> Self:
         prompt, mappings = _resolve_quick_prompt_input(prompt, value, mappings, kwargs)
         self.prompt.set("system", ["{system.user_info} IS IMPORTANT INFORMATION ABOUT USER!"])
         self.prompt.set("system.user_info", prompt, mappings=mappings)
@@ -219,7 +218,7 @@ class ModelRequest:
         *,
         mappings: dict[str, Any] | None = None,
         **kwargs: Any,
-    ):
+    ) -> Self:
         prompt, mappings = _resolve_quick_prompt_input(prompt, value, mappings, kwargs)
         self.prompt.set("input", prompt, mappings=mappings)
         return self
@@ -231,7 +230,7 @@ class ModelRequest:
         *,
         mappings: dict[str, Any] | None = None,
         **kwargs: Any,
-    ):
+    ) -> Self:
         prompt, mappings = _resolve_quick_prompt_input(prompt, value, mappings, kwargs)
         self.prompt.set("info", prompt, mappings=mappings)
         return self
@@ -243,7 +242,7 @@ class ModelRequest:
         *,
         mappings: dict[str, Any] | None = None,
         **kwargs: Any,
-    ):
+    ) -> Self:
         prompt, mappings = _resolve_quick_prompt_input(prompt, value, mappings, kwargs)
         self.prompt.set("instruct", prompt, mappings=mappings)
         return self
@@ -255,7 +254,7 @@ class ModelRequest:
         *,
         mappings: dict[str, Any] | None = None,
         **kwargs: Any,
-    ):
+    ) -> Self:
         prompt, mappings = _resolve_quick_prompt_input(prompt, value, mappings, kwargs)
         self.prompt.set("examples", prompt, mappings=mappings)
         return self
@@ -271,7 +270,7 @@ class ModelRequest:
         *,
         mappings: dict[str, Any] | None = None,
         format: Literal["json", "flat_markdown", "hybrid", "xml_field", "yaml_literal", "auto"] | None = None,
-    ):
+    ) -> Self:
         self.prompt.set("output", prompt, mappings=mappings)
         if format is not None:
             self.prompt.set("output_format", format)
@@ -282,7 +281,7 @@ class ModelRequest:
         prompt: list[dict[str, Any]],
         *,
         mappings: dict[str, Any] | None = None,
-        ):
+    ) -> Self:
         self.prompt.set("attachment", prompt, mappings=mappings)
         return self
 
@@ -296,7 +295,7 @@ class ModelRequest:
         urls: list[str] | tuple[str, ...] | None = None,
         detail: ImageDetail | None = None,
         mappings: dict[str, Any] | None = None,
-    ):
+    ) -> Self:
         self.prompt.set(
             "attachment",
             build_image_attachment(
@@ -311,42 +310,102 @@ class ModelRequest:
         )
         return self
 
-    def validate(self, handler: "OutputValidateHandler"):
+    def validate(self, handler: "OutputValidateHandler") -> Self:
         self.extension_handlers.append("validate_handlers", handler)
         return self
 
-    # Response & Result
-    def get_response(self, *, parent_run_context: "RunContext | None" = None):
+    # Result
+    def _create_model_result(self, *, parent_run_context: "RunContext | None" = None) -> ModelRequestResult:
         if self._model_key:
             from agently.utils.ModelPool import resolve_model_pool_settings
             resolve_model_pool_settings(self._model_key, self.settings)
         parent_run_context = resolve_parent_run_context(parent_run_context)
-        agent_turn_run_context = (
+        agent_execution_run_context = (
             parent_run_context
-            if parent_run_context is not None and parent_run_context.run_kind == "agent_turn"
+            if parent_run_context is not None and parent_run_context.run_kind == "agent_execution"
             else None
         )
-        response = ModelResponse(
+        response = ModelRequestRunner(
             self.agent_name,
             self.plugin_manager,
             self.settings,
             self.prompt,
             self.extension_handlers,
             run_context=self._create_request_run_context(parent_run_context=parent_run_context),
-            agent_turn_run_context=agent_turn_run_context,
+            agent_execution_run_context=agent_execution_run_context,
         )
         response.run_context.response_id = response.id
         self.prompt.clear()
-        return response
+        return response.result
 
-    def get_result(self, *, parent_run_context: "RunContext | None" = None):
-        return self.get_response(parent_run_context=parent_run_context).result
+    def get_result(self, *, parent_run_context: "RunContext | None" = None) -> ModelRequestResult:
+        return self._create_model_result(parent_run_context=parent_run_context)
 
-    async def async_get_meta(self, *, parent_run_context: "RunContext | None" = None):
-        return await self.get_response(parent_run_context=parent_run_context).async_get_meta()
+    def get_response(self, *, parent_run_context: "RunContext | None" = None) -> ModelRequestResult:
+        return self.get_result(parent_run_context=parent_run_context)
 
-    async def async_get_text(self, *, parent_run_context: "RunContext | None" = None):
-        return await self.get_response(parent_run_context=parent_run_context).async_get_text()
+    def get_meta(self, *, parent_run_context: "RunContext | None" = None) -> dict[str, Any]:
+        return self.get_result(parent_run_context=parent_run_context).get_meta()
+
+    async def async_get_meta(self, *, parent_run_context: "RunContext | None" = None) -> dict[str, Any]:
+        return await self.get_result(parent_run_context=parent_run_context).async_get_meta()
+
+    def get_text(self, *, parent_run_context: "RunContext | None" = None) -> str:
+        return self.get_result(parent_run_context=parent_run_context).get_text()
+
+    async def async_get_text(self, *, parent_run_context: "RunContext | None" = None) -> str:
+        return await self.get_result(parent_run_context=parent_run_context).async_get_text()
+
+    @overload
+    def get_data(
+        self,
+        *,
+        type: Literal['parsed'],
+        ensure_keys: list[str],
+        ensure_all_keys: bool | None = None,
+        validate_handler: "OutputValidateHandler | list[OutputValidateHandler] | None" = None,
+        key_style: Literal["dot", "slash"] = "dot",
+        max_retries: int = 3,
+        raise_ensure_failure: bool = True,
+        parent_run_context: "RunContext | None" = None,
+    ) -> dict[str, Any]: ...
+
+    @overload
+    def get_data(
+        self,
+        *,
+        type: Literal['original', 'parsed', 'all'] = "parsed",
+        ensure_keys: list[str] | None = None,
+        ensure_all_keys: bool | None = None,
+        validate_handler: "OutputValidateHandler | list[OutputValidateHandler] | None" = None,
+        key_style: Literal["dot", "slash"] = "dot",
+        max_retries: int = 3,
+        raise_ensure_failure: bool = True,
+        parent_run_context: "RunContext | None" = None,
+    ) -> Any: ...
+
+    def get_data(
+        self,
+        *,
+        type: Literal['original', 'parsed', 'all'] = "parsed",
+        ensure_keys: list[str] | None = None,
+        ensure_all_keys: bool | None = None,
+        validate_handler: "OutputValidateHandler | list[OutputValidateHandler] | None" = None,
+        key_style: Literal["dot", "slash"] = "dot",
+        max_retries: int = 3,
+        raise_ensure_failure: bool = True,
+        parent_run_context: "RunContext | None" = None,
+    ) -> Any:
+        return FunctionShifter.syncify(self.async_get_data)(
+            type=type,
+            ensure_keys=ensure_keys,
+            ensure_all_keys=ensure_all_keys,
+            validate_handler=validate_handler,
+            key_style=key_style,
+            max_retries=max_retries,
+            raise_ensure_failure=raise_ensure_failure,
+            parent_run_context=parent_run_context,
+        )
 
     async def async_get_data(
         self,
@@ -359,17 +418,69 @@ class ModelRequest:
         max_retries: int = 3,
         raise_ensure_failure: bool = True,
         parent_run_context: "RunContext | None" = None,
-    ):
+    ) -> Any:
         if ensure_all_keys is not None:
             self.prompt.set("ensure_all_keys", ensure_all_keys)
-        response = self.get_response(parent_run_context=parent_run_context)
-        return await response.async_get_data(
+        result = self.get_result(parent_run_context=parent_run_context)
+        return await result.async_get_data(
             type=type,
             ensure_keys=ensure_keys,
             validate_handler=validate_handler,
             key_style=key_style,
             max_retries=max_retries,
             raise_ensure_failure=raise_ensure_failure,
+        )
+
+    @overload
+    def get_data_object(
+        self,
+    ) -> "BaseModel | None": ...
+
+    @overload
+    def get_data_object(
+        self,
+        *,
+        ensure_keys: list[str],
+        ensure_all_keys: bool | None = None,
+        validate_handler: "OutputValidateHandler | list[OutputValidateHandler] | None" = None,
+        key_style: Literal["dot", "slash"] = "dot",
+        max_retries: int = 3,
+        raise_ensure_failure: bool = True,
+        parent_run_context: "RunContext | None" = None,
+    ) -> "BaseModel": ...
+
+    @overload
+    def get_data_object(
+        self,
+        *,
+        ensure_keys: None,
+        ensure_all_keys: bool | None = None,
+        validate_handler: "OutputValidateHandler | list[OutputValidateHandler] | None" = None,
+        key_style: Literal["dot", "slash"] = "dot",
+        max_retries: int = 3,
+        raise_ensure_failure: bool = True,
+        parent_run_context: "RunContext | None" = None,
+    ) -> "BaseModel | None": ...
+
+    def get_data_object(
+        self,
+        *,
+        ensure_keys: list[str] | None = None,
+        ensure_all_keys: bool | None = None,
+        validate_handler: "OutputValidateHandler | list[OutputValidateHandler] | None" = None,
+        key_style: Literal["dot", "slash"] = "dot",
+        max_retries: int = 3,
+        raise_ensure_failure: bool = True,
+        parent_run_context: "RunContext | None" = None,
+    ) -> "BaseModel | None":
+        return FunctionShifter.syncify(self.async_get_data_object)(
+            ensure_keys=ensure_keys,
+            ensure_all_keys=ensure_all_keys,
+            validate_handler=validate_handler,
+            key_style=key_style,
+            max_retries=max_retries,
+            raise_ensure_failure=raise_ensure_failure,
+            parent_run_context=parent_run_context,
         )
 
     async def async_get_data_object(
@@ -382,16 +493,62 @@ class ModelRequest:
         max_retries: int = 3,
         raise_ensure_failure: bool = True,
         parent_run_context: "RunContext | None" = None,
-    ):
+    ) -> "BaseModel | None":
         if ensure_all_keys is not None:
             self.prompt.set("ensure_all_keys", ensure_all_keys)
-        response = self.get_response(parent_run_context=parent_run_context)
-        return await response.async_get_data_object(
+        result = self.get_result(parent_run_context=parent_run_context)
+        return await result.async_get_data_object(
             ensure_keys=ensure_keys,
             validate_handler=validate_handler,
             key_style=key_style,
             max_retries=max_retries,
             raise_ensure_failure=raise_ensure_failure,
+        )
+
+    def start(
+        self,
+        *,
+        type: Literal['original', 'parsed', 'all'] = "parsed",
+        ensure_keys: list[str] | None = None,
+        ensure_all_keys: bool | None = None,
+        validate_handler: "OutputValidateHandler | list[OutputValidateHandler] | None" = None,
+        key_style: Literal["dot", "slash"] = "dot",
+        max_retries: int = 3,
+        raise_ensure_failure: bool = True,
+        parent_run_context: "RunContext | None" = None,
+    ) -> Any:
+        return self.get_data(
+            type=type,
+            ensure_keys=ensure_keys,
+            ensure_all_keys=ensure_all_keys,
+            validate_handler=validate_handler,
+            key_style=key_style,
+            max_retries=max_retries,
+            raise_ensure_failure=raise_ensure_failure,
+            parent_run_context=parent_run_context,
+        )
+
+    async def async_start(
+        self,
+        *,
+        type: Literal['original', 'parsed', 'all'] = "parsed",
+        ensure_keys: list[str] | None = None,
+        ensure_all_keys: bool | None = None,
+        validate_handler: "OutputValidateHandler | list[OutputValidateHandler] | None" = None,
+        key_style: Literal["dot", "slash"] = "dot",
+        max_retries: int = 3,
+        raise_ensure_failure: bool = True,
+        parent_run_context: "RunContext | None" = None,
+    ) -> Any:
+        return await self.async_get_data(
+            type=type,
+            ensure_keys=ensure_keys,
+            ensure_all_keys=ensure_all_keys,
+            validate_handler=validate_handler,
+            key_style=key_style,
+            max_retries=max_retries,
+            raise_ensure_failure=raise_ensure_failure,
+            parent_run_context=parent_run_context,
         )
 
     @overload
@@ -408,12 +565,20 @@ class ModelRequest:
         type: Literal["all"],
         *,
         specific: "SpecificEvents" = DEFAULT_SPECIFIC_EVENTS,
-    ) -> Generator[tuple[str, Any], None, None]: ...
+    ) -> Generator["AgentlyModelResultMessage", None, None]: ...
 
     @overload
     def get_generator(
         self,
-        type: Literal["delta", "specific", "original"],
+        type: Literal["specific"],
+        *,
+        specific: "SpecificEvents" = DEFAULT_SPECIFIC_EVENTS,
+    ) -> Generator["AgentlySpecificResultMessage", None, None]: ...
+
+    @overload
+    def get_generator(
+        self,
+        type: Literal["delta"],
         *,
         specific: "SpecificEvents" = DEFAULT_SPECIFIC_EVENTS,
     ) -> Generator[str, None, None]: ...
@@ -421,20 +586,28 @@ class ModelRequest:
     @overload
     def get_generator(
         self,
-        type: "ResponseContentType | None" = "delta",
+        type: Literal["original"],
+        *,
+        specific: "SpecificEvents" = DEFAULT_SPECIFIC_EVENTS,
+    ) -> Generator["AgentlyOriginalResultPayload", None, None]: ...
+
+    @overload
+    def get_generator(
+        self,
+        type: "ResultContentType | None" = "delta",
         *,
         specific: "SpecificEvents" = DEFAULT_SPECIFIC_EVENTS,
     ) -> Generator: ...
 
     def get_generator(
         self,
-        type: "ResponseContentType | None" = None,
-        content: "ResponseContentType | None" = None,
+        type: "ResultContentType | None" = None,
+        content: "ResultContentType | None" = None,
         *,
         specific: "SpecificEvents" = DEFAULT_SPECIFIC_EVENTS,
         parent_run_context: "RunContext | None" = None,
     ) -> Generator:
-        return self.get_response(parent_run_context=parent_run_context).get_generator(
+        return self.get_result(parent_run_context=parent_run_context).get_generator(
             type=type,
             content=content,
             specific=specific,
@@ -454,12 +627,20 @@ class ModelRequest:
         type: Literal["all"],
         *,
         specific: "SpecificEvents" = DEFAULT_SPECIFIC_EVENTS,
-    ) -> AsyncGenerator[tuple[str, Any], None]: ...
+    ) -> AsyncGenerator["AgentlyModelResultMessage", None]: ...
 
     @overload
     def get_async_generator(
         self,
-        type: Literal["delta", "specific", "original"],
+        type: Literal["specific"],
+        *,
+        specific: "SpecificEvents" = DEFAULT_SPECIFIC_EVENTS,
+    ) -> AsyncGenerator["AgentlySpecificResultMessage", None]: ...
+
+    @overload
+    def get_async_generator(
+        self,
+        type: Literal["delta"],
         *,
         specific: "SpecificEvents" = DEFAULT_SPECIFIC_EVENTS,
     ) -> AsyncGenerator[str, None]: ...
@@ -467,20 +648,28 @@ class ModelRequest:
     @overload
     def get_async_generator(
         self,
-        type: "ResponseContentType | None" = "delta",
+        type: Literal["original"],
+        *,
+        specific: "SpecificEvents" = DEFAULT_SPECIFIC_EVENTS,
+    ) -> AsyncGenerator["AgentlyOriginalResultPayload", None]: ...
+
+    @overload
+    def get_async_generator(
+        self,
+        type: "ResultContentType | None" = "delta",
         *,
         specific: "SpecificEvents" = DEFAULT_SPECIFIC_EVENTS,
     ) -> AsyncGenerator: ...
 
     def get_async_generator(
         self,
-        type: "ResponseContentType | None" = None,
-        content: "ResponseContentType | None" = None,
+        type: "ResultContentType | None" = None,
+        content: "ResultContentType | None" = None,
         *,
         specific: "SpecificEvents" = DEFAULT_SPECIFIC_EVENTS,
         parent_run_context: "RunContext | None" = None,
     ) -> AsyncGenerator:
-        return self.get_response(parent_run_context=parent_run_context).get_async_generator(
+        return self.get_result(parent_run_context=parent_run_context).get_async_generator(
             type=type,
             content=content,
             specific=specific,
@@ -489,6 +678,6 @@ class ModelRequest:
 
 __all__ = [
     "ModelRequest",
+    "ModelRequestResult",
     "ModelResponse",
-    "ModelResponseResult",
 ]

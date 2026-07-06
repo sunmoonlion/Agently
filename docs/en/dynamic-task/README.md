@@ -1,9 +1,13 @@
-# Dynamic Task
+# TaskDAG And Dynamic Task
 
-Dynamic Task is a first-class Agently task surface for model-generated or
-app-generated DAGs. It exposes a compact app-facing API, validates a `TaskDAG`,
-resolves task handlers, and compiles the graph to ordinary TriggerFlow
-execution as an implementation substrate.
+`TaskDAG` is Agently's foundation DAG capability for model-generated or
+app-generated task graphs. It owns the graph data contract, planner, validator,
+resolver, executor, handler binding, dependency results, semantic outputs, and
+runtime placeholders. TriggerFlow remains the lower-level execution substrate.
+
+`DynamicTask` is the current compatibility and convenience facade over this DAG
+substrate. It is useful when ordinary app code wants one compact entrypoint, but
+it is not a second recommended task lifecycle beside `AgentExecution`.
 
 ```python
 task = Agently.create_dynamic_task(target="review policy")
@@ -41,6 +45,36 @@ task = Agently.create_dynamic_task(
 snapshot = await task.async_start(timeout=10)
 ```
 
+Advanced callers can decompose the same DAG path into independent modules,
+customize them, and then pass the DAG snapshot as evidence to a later
+`AgentExecution` when an agent needs to summarize, verify, or act on the result:
+
+```python
+from agently.builtins.plugins import AgentlyTaskDAGPlanner
+from agently.core import TaskDAGExecutor, TaskDAGResolver, TaskDAGValidator
+
+handlers = {
+    "fetch_handler": fetch_handler,
+    "analyze_handler": analyze_handler,
+    "render_handler": render_handler,
+}
+resolver = TaskDAGResolver(handlers)
+validator = TaskDAGValidator(resolver)
+planner = AgentlyTaskDAGPlanner(validator=validator)
+
+graph = await planner.async_plan(planner_agent, {"target": goal})
+validator.validate(graph, strict_schema_version=True)
+
+snapshot = await TaskDAGExecutor(resolver, validator=validator).async_run(
+    graph,
+    graph_input={"goal": goal},
+)
+
+execution = agent.create_execution()
+execution.input({"goal": goal, "dag_snapshot": snapshot})
+result = await execution.async_start()
+```
+
 Submitted DAG `inputs` may reference runtime data with placeholders. A whole
 string placeholder preserves the original value type; embedded placeholders are
 rendered into the surrounding string. Slot names are case-insensitive, but docs
@@ -74,11 +108,12 @@ points at the raw TriggerFlow trigger payload (`data.value`) and is mainly for
 advanced debugging or executor-level integrations. Missing runtime paths fail
 closed during task execution instead of staying as unresolved strings.
 
-When a submitted DAG runs through `agent.use_dynamic_task(...).create_execution()`,
-`${INIT...}` first reads an explicit `use_dynamic_task(graph_input=...)` value.
-If that argument is omitted, it reads the execution prompt snapshot `input` slot
-captured by `create_execution()`. Only when neither source exists does the Agent
-route fall back to `{"target": task_target}`.
+When a submitted DAG runs through `Agently.create_dynamic_task(...).async_run(...)`,
+`${INIT...}` reads the `graph_input` argument passed to `async_run`. If
+`graph_input` is omitted, DynamicTask falls back to the target payload
+`{"target": task_target}`. AgentExecution no longer owns a DynamicTask route, so
+`Agent.use_dynamic_task(...)` and `AgentExecution.use_dynamic_task(...)` fail
+fast with a migration diagnostic.
 
 If `create_dynamic_task(..., output_schema=..., ensure_keys=...)` supplies the
 frontstage contract for a semantic-output model node, that host contract wins
@@ -106,39 +141,12 @@ snapshot = await task.async_run(graph_input={"doc": "policy"}, timeout=10)
 for selecting one DAG inside a larger config file. Use `graph.get_yaml(path)`
 or `graph.get_json(path)` to export a normalized graph.
 
-Agent instances expose the same facade:
-
-```python
-task = agent.create_dynamic_task(target="review policy")
-```
-
-Agent prompt methods are configuration. `agent.create_dynamic_task()` consumes
-the same prompt snapshot as `agent.start()` / `agent.create_execution()`:
-
-```python
-task = (
-    agent
-    .info({"customer": "Acme"})
-    .instruct("Focus on renewal risk and account-team actions.")
-    .input({"account": "Acme", "ticket": "T-42"})
-    .output({
-        "summary": (str, "risk summary", True),
-        "risks": ([str], "risk bullets", True),
-    }, format="json")
-    .create_dynamic_task()
-)
-```
-
-The prompt snapshot is rendered through the normal Prompt generator to become
-the Dynamic Task target. The `output` slot becomes the facade-level
-`output_schema`, and `output_format` becomes the default model-task format.
-`set_agent_prompt(...)` / `always=True` values are inherited. In a quick prompt
-chain, turn prompt values are held on the AgentTurn draft and frozen into the
-new task; direct `set_turn_prompt(...)`, compatibility
-`set_request_prompt(...)`, and `agent.request` values remain the lower-level
-request-builder compatibility path. Explicit
-`create_dynamic_task(target=..., output_schema=..., output_format=...)`
-arguments override prompt-derived defaults.
+Prefer `Agently.create_dynamic_task(...)` for current DAG workflow code. The
+older `agent.create_dynamic_task(...)` compatibility facade remains available
+for prompt-snapshot callers, but new examples should keep DynamicTask separate
+from `agent.start()`, `agent.async_start()`, and `AgentExecution.async_start()`.
+Explicit `create_dynamic_task(target=..., output_schema=..., output_format=...)`
+arguments define the facade-level model-task defaults.
 
 For model tasks, use Agently's request output pipeline instead of parsing model
 text in handlers or examples. `output_schema` applies to semantic output model
@@ -195,13 +203,13 @@ surrounding text.
 
 ## Architecture
 
-Dynamic Task is split into four stages:
+The DAG capability is split into four stages:
 
 - `AgentlyTaskDAGPlanner` generates deterministic `TaskDAG` data with Agently
   output schema, `ensure_keys`, and validation retry.
 - `TaskDAGValidator` validates DAG syntax, dependencies, schema version,
   semantic outputs, side-effect policy, and resolver availability.
-- `DynamicTaskResolver` maps `task.binding`, `task.id`, then `task.kind` to a
+- `TaskDAGResolver` maps `task.binding`, `task.id`, then `task.kind` to a
   runnable handler.
 - `TaskDAGExecutor` compiles the validated DAG to ordinary TriggerFlow chunks
   and runs it through TriggerFlow lifecycle, stream, pause/resume, result, and
@@ -242,9 +250,9 @@ control:
 
 ```python
 from agently.builtins.plugins import AgentlyTaskDAGPlanner
-from agently.core import DynamicTaskResolver, TaskDAGExecutor, TaskDAGValidator
+from agently.core import TaskDAGResolver, TaskDAGExecutor, TaskDAGValidator
 
-resolver = DynamicTaskResolver({"risk_check_handler": risk_check_handler})
+resolver = TaskDAGResolver({"risk_check_handler": risk_check_handler})
 validator = TaskDAGValidator(resolver)
 planner = AgentlyTaskDAGPlanner(validator=validator)
 
@@ -254,8 +262,8 @@ snapshot = await TaskDAGExecutor(resolver, validator=validator).async_run(graph)
 ```
 
 The executor does not depend on Agent. Model and action access belong to the
-facade or resolver adapters, while TriggerFlow remains the execution substrate
-under Dynamic Task rather than the owner API.
+facade or resolver adapters, while TriggerFlow remains the lower-level
+execution substrate rather than the DAG owner API.
 
 ## Examples
 
@@ -272,7 +280,7 @@ Use the examples in `examples/dynamic_task/` by layer:
   deterministic local handlers, backend risk scoring, and a printed risk memo.
 - `04_incident_briefing_auto_plan.py`: auto-planned incident briefing example
   with a simple `IncidentBriefingService.brief(report)` facade. The model
-  creates the `TaskDAG`; Dynamic Task validates and executes it, while the
+  creates the `TaskDAG`; the DAG validator and executor run it, while the
   frontstage briefing shape is enforced through Agently `output_schema`.
 - `05_enterprise_renewal_complex_auto_plan.py`: complex auto-planned renewal
   example where the model planner creates several independent analysis roots,

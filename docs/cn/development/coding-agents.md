@@ -36,9 +36,9 @@ skill **不是**纯文档。它为 coding agent 结构化：每个 skill 告诉 
 
 | Skill | 用户在做的事 |
 |---|---|
-| `agently-playbook` | 从零开始 —— 选合适的项目结构 |
+| `agently` | 从零开始 —— 选合适的项目结构 |
 | `agently-request` | 模型接入、Prompt 管理、结构化输出、响应复用、session memory、embedding、检索 |
-| `agently-runtime` | Action Runtime、内置 actions、MCP、Execution Environment、FastAPI 暴露、DevTools 接入 |
+| `agently-runtime` | Action Runtime、内置 actions、MCP、ExecutionResource、FastAPI 暴露、DevTools 接入 |
 | `agently-dynamic-task` | 模型生成或应用提交的 DAG 规划、校验和执行 |
 | `agently-triggerflow` | 需要分支、并发、pause/resume、save/load |
 | `agently-migration` | 从 LangChain、LangGraph、LlamaIndex、CrewAI 或类似系统迁移 |
@@ -63,7 +63,7 @@ skill 是纯文本 + 脚本；安装时不跑 Agently 特定的东西。
 
 ```bash
 for skill in \
-  agently-playbook \
+  agently \
   agently-request \
   agently-runtime \
   agently-dynamic-task \
@@ -73,8 +73,10 @@ do
 done
 ```
 
-只有迁移项目才额外安装 `agently-migration`。冻结的 V1 12-skill catalog 位于
-`Agently-Skills/legacy/v1/`，最后支持 Agently `4.1.1`；不要把它作为新项目推荐路径。
+只有迁移项目才额外安装 `agently-migration`。历史 catalog 通过冻结归档分支保留，
+而不是放在默认分支文件树里；V1 12-skill catalog 归档在
+`update/archive-legacy-v1-catalog`，最后支持 Agently `4.1.1`。新项目不要把归档
+catalog 加入 coding agent 的常规搜索路径。
 
 ## 为什么是 skill 不是单纯文档
 
@@ -105,13 +107,14 @@ issue 必须把遭遇问题时的具体场景讲清楚，说明当时尝试解�
 当你审计或编写面向 Agently `4.1+` 的指导时，coding agent 应默认偏向这些用法：
 
 - API 形态：遵守奥卡姆剃刀原则。如无必要，勿增实体、方法、facade 或兼容补丁；已有表面能清晰承载语义时优先复用。若只是命名表意不清，优先建议窄别名或文档澄清，而不是再加一个容易重叠的方法。
-- 结构化输出：固定必填叶子直接写在 `.output(...)` 的 `(TypeExpr, "description", True)` 里。手动 `ensure_keys=` 只留给条件路径或运行时决定的路径。
+- 结构化输出：固定必填叶子直接写在 `.output(...)` 的 `(TypeExpr, "description", True)` 里。只有空值必须触发重试时才用 `(TypeExpr, "description", "not_null")`。手动 `ensure_keys=` 只留给条件路径或运行时决定的路径。
 - Actions：新代码从 `@agent.action_func` 和 `agent.use_actions(...)` 起步。`tool_func`、`use_tool`、`use_tools` 是兼容别名，不是首选推荐。
 - TriggerFlow lifecycle：把 `close()` / `async_close()` 和 close snapshot 视为规范收尾路径。不要把 `.end()`、`set_result()`、`get_result()`、`wait_for_result=` 当正常起点。
 - TriggerFlow state：单次 execution 的数据用 `get_state(...)` / `set_state(...)`。`flow_data` 是有意共享时才使用的风险作用域，不是普通状态存储。
 - Settings 加载：provider 配置落文件时，优先 `Agently.load_settings("yaml_file", path, auto_load_env=True)`。`Agently.set_settings(...)` 留给内联覆盖。
 - 执行风格：服务、流式、工作流默认 async-first。sync API 视为脚本、REPL 或兼容桥接层。
-- 响应复用：一次模型调用如果要同时消费文本、结构化数据、metadata 或流式更新，优先 `get_response()` 复用同一个 response，而不是重复发请求。
+- Result 复用：一次模型调用如果要同时消费文本、结构化数据、metadata 或流式更新，优先 `get_result()` 复用同一个 result，而不是重复发请求。
+- 任务执行质量：当一个目标驱动任务必须使用某个能力（Action、Skill 或 Skill pack）时，不要靠 prompt 里的强指令或业务特例去强制或检查它。把要求表达为框架契约：让能力对规划器可见（`planner_capabilities`），用会传到 ActionRuntime 边界的结构化 `step_scope` 约束 action 步骤范围，并用结构化的 `capability_evidence_requirements` 声明完成证据要求。Skills 步骤如果可能产出很长的 artifact 文本，应配置 Skills route 的输出格式，而不是强行让大段原始内容走 JSON streaming。若 Skills 步骤需要文件写入/读回、shell、HTTP 或其它副作用，必须通过 route/effort 配置显式授权 action/tool 范围；当 React 策略应在这些副作用成功后停止时，声明 required side-effect actions，并为宿主 actions 声明 `action_succeeded` 证据。Skills 提供指导，ActionRuntime 负责可调用执行和证据。上一轮 Workspace context 必须优先保留 action evidence，而不是被大块执行元数据挤掉。TaskDAG / DynamicTask 不是 AgentTask 的 bounded-step 策略；当应用或可视化自动化界面拥有提交式 DAG 时，单独使用 TaskDAG / DynamicTask。AgentTask 的 host guard 会拿这个要求与执行证据做确定性比对；prompt 只是说明，不是保障。场景特定的检查（视觉指纹、领域名称、来源选择）只留在 example 和测试里，绝不进入框架路径。
 
 ## 何时写自己的 skill
 
@@ -125,7 +128,7 @@ issue 必须把遭遇问题时的具体场景讲清楚，说明当时尝试解�
 
 用户可见 feature work 必须为功能所对应的场景新增或更新 examples。example 应在声明环境中可运行，使用当前推荐 API，并通过输出、断言或注释把关键运行时行为展示出来。`Expected key output` 注释应保留一次实际运行中的稳定关键值，而不是只写“可以看到 X”一类泛化描述。当输出本身不足以解释行为时，可在 example 注释中补充简短工作原理或 ASCII 流程图。
 
-对 Agently `4.1.3` 开发线，如果任务涉及默认 `agent.start()` 路由、`agent.create_execution()` 或 Agent 过程流式输出，需要纳入 `examples/agent_auto_orchestration/`。该目录中的本地 smoke 脚本只能作为基础设施检查；模型应用或验收结论仍必须来自真实 DeepSeek 或本地 Ollama 示例。对 4.1.2.5 基础能力线，把 `examples/cookbook/`、`examples/action_runtime/`、`examples/execution_environment/`、`examples/builtin_actions/`、`examples/trigger_flow/`、`examples/dynamic_task/` 和 `examples/fastapi/` 视为推荐起点；`examples/archived/` 只作为兼容参考。
+对 Agently `4.1.3` 开发线，如果任务涉及默认 `agent.start()` 路由、`agent.create_execution()` 或 Agent 过程流式输出，需要纳入 `examples/agent_auto_orchestration/`。该目录中的本地 smoke 脚本只能作为基础设施检查；模型应用或验收结论仍必须来自真实 DeepSeek 或本地 Ollama 示例。对 4.1.2.5 基础能力线，把 `examples/cookbook/`、`examples/action_runtime/`、`examples/execution_resource/`、`examples/builtin_actions/`、`examples/trigger_flow/`、`examples/dynamic_task/` 和 `examples/fastapi/` 视为推荐起点；`examples/archived/` 只作为兼容参考。
 
 汇报 API、推荐用法、examples 或兼容线变化时，应给出能直观看出新用法的简短样例代码。能用当前用法或 before/after 片段说明时，优先用代码片段而不是抽象描述。
 

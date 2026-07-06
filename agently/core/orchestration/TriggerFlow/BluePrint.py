@@ -35,10 +35,11 @@ if TYPE_CHECKING:
         TriggerFlowSubFlowCapture,
         TriggerFlowSubFlowWriteBack,
     )
-    from agently.types.data import ExecutionEnvironmentRequirement
+    from agently.types.data import ExecutionResourceRequirement
     from .TriggerFlow import TriggerFlow
 
 from agently.types.data import EMPTY
+from agently.types.trigger_flow.runtime_keys import AGGREGATION_SCOPE_META_KEY
 from agently.utils import StateDataNamespace
 from .Chunk import TriggerFlowChunk
 from .Execution import TriggerFlowExecution
@@ -630,7 +631,12 @@ class TriggerFlowBlueprint:
 
     @staticmethod
     def _layer_key(data):
-        return ".".join(data._layer_marks) if data._layer_marks else "__root__"
+        if data._layer_marks:
+            return ".".join(data._layer_marks)
+        signal_scope = data.signal_meta.get(AGGREGATION_SCOPE_META_KEY)
+        if signal_scope is not None:
+            return f"signal:{ signal_scope }"
+        return "__root__"
 
     def _compile_chunk_operator(self, operator: dict[str, Any]):
         handler = self._resolve_callable("chunk", operator.get("handler_ref"))
@@ -715,12 +721,15 @@ class TriggerFlowBlueprint:
         concurrency = operator["options"].get("concurrency")
 
         async def send_to_branches(data):
+            data.layer_in()
+            layer_marks = data._layer_marks.copy()
+
             async def emit_branch(signal: dict[str, Any]):
                 if concurrency is None or concurrency <= 0:
                     await data.async_emit(
                         signal["trigger_event"],
                         data.value,
-                        _layer_marks=data._layer_marks.copy(),
+                        _layer_marks=layer_marks,
                     )
                     return
                 semaphore_key = f"batch_fanout_semaphores.{ operator['id'] }"
@@ -732,10 +741,13 @@ class TriggerFlowBlueprint:
                     await data.async_emit(
                         signal["trigger_event"],
                         data.value,
-                        _layer_marks=data._layer_marks.copy(),
+                        _layer_marks=layer_marks,
                     )
 
-            await gather_cancel_on_error(*[emit_branch(signal) for signal in operator["emit_signals"]])
+            try:
+                await gather_cancel_on_error(*[emit_branch(signal) for signal in operator["emit_signals"]])
+            finally:
+                data.layer_out()
 
         for signal in operator["listen_signals"]:
             self.add_handler(signal["trigger_type"], signal["trigger_event"], send_to_branches, id=operator["id"])
@@ -765,6 +777,7 @@ class TriggerFlowBlueprint:
             for done in state["triggers"].values():
                 if done is False:
                     return
+            data.layer_out()
             await data.async_emit(
                 emit_signal["trigger_event"],
                 state["results"],
@@ -777,6 +790,17 @@ class TriggerFlowBlueprint:
 
     def _compile_for_each_split_operator(self, operator: dict[str, Any]):
         emit_signal = operator["emit_signals"][0]
+        end_signal = next(
+            (
+                signal
+                for signal in operator.get("emit_signals", [])
+                if str(signal.get("trigger_event", "")).endswith("-End")
+            ),
+            None,
+        )
+        if end_signal is None:
+            group_id = operator.get("group_id") or str(operator["id"]).removeprefix("for_each-split-")
+            end_signal = self.make_signal("event", f"ForEach-{ group_id }-End", role="continuation")
         concurrency = operator["options"].get("concurrency")
 
         async def send_items(data):
@@ -816,6 +840,14 @@ class TriggerFlowBlueprint:
 
             if not isinstance(data.value, str) and isinstance(data.value, Sequence):
                 items = list(data.value)
+                if not items:
+                    data.layer_out()
+                    await data.async_emit(
+                        end_signal["trigger_event"],
+                        [],
+                        data._layer_marks.copy(),
+                    )
+                    return
                 for item in items:
                     layer_marks, item_value = prepare_item(item)
                     send_tasks.append(emit_item(item_value, layer_marks))
@@ -915,6 +947,7 @@ class TriggerFlowBlueprint:
                         _layer_marks=data._layer_marks.copy(),
                     )
                 else:
+                    data.layer_out()
                     await data.async_emit(
                         emit_signal["trigger_event"],
                         data.value,
@@ -1074,6 +1107,16 @@ class TriggerFlowBlueprint:
             name=name if name is not None else self.name,
         )
 
+    def _get_definition_fingerprint(self):
+        config = self.definition.to_dict(
+            validate_serializable=False,
+            name=self.name,
+        )
+        config = copy.deepcopy(config)
+        config.pop("name", None)
+        digest = hashlib.sha256(_stable_definition_json(config).encode("utf-8")).hexdigest()
+        return f"sha256:{ digest }"
+
     def get_json_flow(
         self,
         save_to: str | Path | None = None,
@@ -1210,7 +1253,7 @@ class TriggerFlowBlueprint:
         auto_close_timeout: float | None = 10.0,
         owner_id: str | None = None,
         lease_ttl: float | None = None,
-        execution_environments: "list[ExecutionEnvironmentRequirement] | None" = None,
+        execution_resources: "list[ExecutionResourceRequirement] | None" = None,
         intervention_mode: Literal["planned", "auto"] | None = None,
         intervention_policy: Any = None,
         resume_handle_exposed: bool = True,
@@ -1231,7 +1274,7 @@ class TriggerFlowBlueprint:
             auto_close_timeout=auto_close_timeout,
             owner_id=owner_id,
             lease_ttl=lease_ttl,
-            execution_environments=execution_environments,
+            execution_resources=execution_resources,
             intervention_mode=intervention_mode,
             intervention_policy=intervention_policy,
             resume_handle_exposed=resume_handle_exposed,

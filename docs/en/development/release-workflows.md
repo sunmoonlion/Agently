@@ -88,6 +88,28 @@ adjustments, make those changes in the release PR, rerun the relevant
 validation, and only then merge. Do not merge first and treat release-note fixes
 as follow-up marketing work.
 
+## Upgrade Information Format
+
+Every user-facing upgrade explanation must include both sample code and a core
+changes table. This applies to release notes, release PR bodies, issue closeout
+comments, maintainer-facing upgrade summaries, and docs pages that explain a
+new or changed public surface.
+
+The sample code must show the recommended current usage shape. If an API shape
+changed, include a before/after snippet. If the upgrade has no callable API,
+show the relevant configuration, CLI command, manifest entry, or workflow YAML
+instead. Do not use pseudo-code unless it is explicitly marked as conceptual.
+
+The core changes table must include at least these columns:
+
+| Area | What changed | Recommended usage | Compatibility / risk | Evidence |
+|---|---|---|---|---|
+| Public API / docs / runtime area | User-visible behavior or contract | Method, config, command, or example path | Additive, breaking, policy-gated, deferred, or no-op | Tests, examples, specs, compatibility metadata, or companion validation |
+
+When a claimed slice is only partially implemented, the table must include a
+deferred row with the remaining scope and the spec or issue that owns it. Do not
+hide deferred work in prose after the table.
+
 ## Acceptance Argument
 
 Before recommending a release, write a coverage-first acceptance argument for
@@ -106,6 +128,9 @@ rules. Then map each requirement to the evidence that proves it:
 - docs, compatibility manifests, spec reconciliation, and companion guidance
 - DevTools or other companion validation when runtime events, observation
   payloads, lineage, or companion protocols changed
+- public typing and IDE metadata checks when public APIs, data contracts,
+  stream payloads, callbacks, handlers, facades, or companion package surfaces
+  changed
 
 Examples prove that the release solves a real scenario. They must not be the
 only proof for compatibility behavior, protocol boundaries, route lifecycle,
@@ -119,6 +144,64 @@ link to it. Do not accept a release by pointing directly at existing examples,
 tests, or closed issues without first checking that those evidence sources cover
 the target contract.
 
+## Public Typing And IDE Support
+
+Public typing completeness is a release gate. A framework release must keep
+Pylance/pyright-compatible IDE hints useful for both the source checkout and the
+installed package.
+
+Before release:
+
+- run `pyright` over `agently/`, `tests/`, and `examples/` with the release
+  candidate interpreter before running `pytest`
+- audit changed public surfaces for missing annotations and unjustified broad
+  `Any`
+- confirm `agently/py.typed` exists in the source tree and is included in the
+  built or installed package
+- run a Pylance-equivalent `pyright` smoke from outside the repository source
+  path against an installed candidate package, importing representative public
+  root APIs and changed public surfaces
+- record commands, interpreter, package source, and result in the release PR
+  body or review notes
+
+If the release also publishes or recommends a companion Python package such as
+`agently-devtools`, run the same source and installed-package typing/IDE smoke
+for that companion before declaring the release line aligned.
+
+## Foundation Example Effect Gate
+
+Foundation-layer capabilities are release-critical framework substrate, not
+application-level use cases. Examples include ModelRequest/ModelResponse,
+TriggerFlow, Dynamic Task/TaskDAG, ActionRuntime, ExecutionResource,
+Workspace/ContextBuilder/ContextPackage, RuntimeEvent/EventCenter, and provider protocols. When a
+release touches or claims one of these substrate capabilities, tests are not
+enough by themselves: the release reviewer must also run the corresponding core
+example under `examples/` and confirm the real effect still works through the
+recommended public API.
+
+AgentExecution, AgentTask, Skills workflows, and business examples can be
+release use-case checks, but they are not Foundation checks by themselves. Map
+them to this gate only when the release also touches a Foundation substrate they
+depend on, such as ModelRequest result materialization, TriggerFlow lifecycle,
+or Dynamic Task DAG execution.
+
+For each affected Foundation capability:
+
+- name the protected Foundation capability and the user-visible effect
+- list the runnable core example that proves that effect, adding one before
+  release when none exists
+- run the example against the release candidate after pyright and pytest
+- use real DeepSeek or local Ollama when the effect includes model-owned
+  planning, routing, verification, or response generation
+- record command, environment, and stable key output, artifact, stream,
+  metadata, or side-effect evidence in the release PR body or review notes
+
+This gate fails closed. Do not release by arguing that unit tests passed if the
+Foundation example effect check is missing or broken. Either fix the example or
+the release candidate, remove the release claim, explicitly defer the affected
+Foundation capability in specs and release notes, or record a maintainer waiver
+with the residual risk.
+
 ## Release PR Body
 
 The release PR from `dev` to `main` must include enough information for a
@@ -131,6 +214,9 @@ At minimum, include:
 - change summary grouped by user-visible capability
 - coverage-first acceptance argument or matrix
 - validation commands and results, including any skipped or failed checks
+- public typing and Pylance/pyright IDE metadata checks for source and installed
+  package candidates
+- Foundation example effect checks for touched Foundation-layer capabilities
 - clean install smoke environment and result
 - compatibility manifest updates and companion repository status
 - DevTools version or protocol recommendation when runtime events,
